@@ -56,6 +56,33 @@ window.storage = {
   },
 };
 
+// ---- Cloud backups: extra rows in the same table (id starts with "backup-"), never touching the "main" row. ----
+const BACKUP_PREFIX = "backup-";
+const assertBackupId = (id) => { if (typeof id !== "string" || !id.startsWith(BACKUP_PREFIX)) throw new Error("invalid backup id"); };
+window.cloudBackups = {
+  async list() {
+    const { data, error } = await supabase.from("shop_data").select("id, updated_at, meta:data->meta").like("id", BACKUP_PREFIX + "%").order("updated_at", { ascending: false });
+    if (error) throw error;
+    return data || [];
+  },
+  async get(id) {
+    assertBackupId(id);
+    const { data, error } = await supabase.from("shop_data").select("data").eq("id", id).single();
+    if (error) throw error;
+    return data.data;
+  },
+  async put(id, payload) {
+    assertBackupId(id);
+    const { error } = await supabase.from("shop_data").upsert({ id, data: payload, updated_at: new Date().toISOString() });
+    if (error) throw error;
+  },
+  async remove(id) {
+    assertBackupId(id);
+    const { error } = await supabase.from("shop_data").delete().eq("id", id);
+    if (error) throw error;
+  },
+};
+
 // ---- One-time migration: if this browser already has locally-saved shop data
 // (from before the cloud connection existed) and the cloud is still empty,
 // offer to upload it once so nothing already entered gets lost. ----

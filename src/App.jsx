@@ -32,6 +32,96 @@ function buildVoucher(counters, fields, createdBy) {
   const { no, counters: c } = nextCounter(counters, "voucher");
   return { voucher: { id: uid("v"), voucherNo: no, createdAt: new Date().toISOString(), createdBy: createdBy || "", ...fields }, counters: c };
 }
+// Numbers (orders, groups, customers, purchases, vouchers, journals, employee entries) only ever go UP.
+// Deleting an invoice/voucher never frees its number: counters are raised to the highest number that exists
+// (covers restored backups / imports with a stale counter) but are never lowered.
+function normalizeCounters(d) {
+  if (!d) return d;
+  const c = { ...(d.counters || {}) };
+  const up = (key, arr, field, start) => { const top = Math.max(Number(c[key]) || start, ...(arr || []).map((x) => Number(x?.[field]) || 0)); c[key] = top; };
+  up("order", d.orders, "orderNo", 1000); up("group", d.orderGroups, "groupNo", 1000); up("customer", d.customers, "code", 1000);
+  up("purchase", d.purchases, "purchaseNo", 1000); up("voucher", d.vouchers, "voucherNo", 1000); up("journal", d.journalEntries, "journalNo", 1000);
+  up("empEntry", d.employeeLedger, "entryNo", 5000);
+  const same = Object.keys(c).every((k) => c[k] === (d.counters || {})[k]);
+  return same ? d : { ...d, counters: c };
+}
+// ---------- Multi-device safe saving ----------
+// The whole shop lives in one cloud row, so two devices saving "their copy" would erase each other's work.
+// Every save therefore (1) reads the latest cloud copy, (2) does a 3-way merge between
+// the last copy this device synced (base), what this device holds now (local) and the cloud copy,
+// then (3) writes the merged result. Records are matched by id, fields are merged one by one,
+// account balances are merged as deltas, counters take the maximum, and numbers that two devices
+// issued at the same time are renumbered instead of duplicated.
+function deepEq(a, b) {
+  if (a === b) return true;
+  if (typeof a !== typeof b || a === null || b === null || typeof a !== "object") return false;
+  if (Array.isArray(a) !== Array.isArray(b)) return false;
+  if (Array.isArray(a)) { if (a.length !== b.length) return false; for (let i = 0; i < a.length; i++) if (!deepEq(a[i], b[i])) return false; return true; }
+  const ka = Object.keys(a).filter((k) => a[k] !== undefined), kb = Object.keys(b).filter((k) => b[k] !== undefined);
+  return ka.length === kb.length && ka.every((k) => deepEq(a[k], b[k]));
+}
+const isIdArray = (a) => Array.isArray(a) && a.every((x) => x && typeof x === "object" && x.id !== undefined);
+function mergeRecord(b, l, c) {
+  const out = { ...c };
+  Object.keys(l).forEach((k) => {
+    if (!deepEq(l[k], b[k])) out[k] = (k === "balance" && typeof l[k] === "number") ? (Number(c[k]) || 0) + (l[k] - (Number(b[k]) || 0)) : l[k];
+  });
+  Object.keys(b).forEach((k) => { if (!(k in l)) delete out[k]; });
+  return out;
+}
+function mergeArrayById(base, local, cloud) {
+  const bm = new Map(base.map((x) => [x.id, x])), lm = new Map(local.map((x) => [x.id, x])), cm = new Map(cloud.map((x) => [x.id, x]));
+  const seen = new Set(), out = [];
+  [...cloud, ...local].forEach((x) => {
+    if (seen.has(x.id)) return; seen.add(x.id);
+    const b = bm.get(x.id), l = lm.get(x.id), c = cm.get(x.id);
+    let r = null;
+    if (l && c) r = !b ? l : deepEq(l, b) ? c : deepEq(c, b) ? l : mergeRecord(b, l, c);
+    else if (l && !c) r = b ? (deepEq(l, b) ? null : l) : l;       // deleted elsewhere: drop unless edited here
+    else if (!l && c) r = b ? null : c;                              // deleted here / added elsewhere
+    if (r) out.push(r);
+  });
+  return out;
+}
+function mergeValue(key, b, l, c) {
+  if (key === "counters" && l && c) { const o = { ...c }; Object.keys(l).forEach((k) => { o[k] = Math.max(Number(o[k]) || 0, Number(l[k]) || 0); }); return o; }
+  if (deepEq(l, b)) return c;
+  if (deepEq(c, b)) return l;
+  if (isIdArray(l) && isIdArray(c)) return mergeArrayById(isIdArray(b) ? b : [], l, c);
+  if (Array.isArray(l) && Array.isArray(c)) { const out = [...c]; l.forEach((x) => { if (!out.some((y) => deepEq(x, y))) out.push(x); }); return out; }
+  if (l && c && typeof l === "object" && typeof c === "object" && !Array.isArray(l) && !Array.isArray(c)) {
+    const bb = b && typeof b === "object" && !Array.isArray(b) ? b : {};
+    const out = {}; Object.keys({ ...c, ...l }).forEach((k) => { const v = mergeValue(k, bb[k], l[k], c[k]); if (v !== undefined) out[k] = v; });
+    return out;
+  }
+  return l;
+}
+function mergeData(base, local, cloud) {
+  if (!base || !cloud) return local;
+  const out = {}; Object.keys({ ...cloud, ...local }).forEach((k) => { const v = mergeValue(k, base[k], local[k], cloud[k]); if (v !== undefined) out[k] = v; });
+  return out;
+}
+const NUMBERED = [["orders", "orderNo", "order", "طلب"], ["orderGroups", "groupNo", "group", "طلبية"], ["customers", "code", "customer", "كود عميل"], ["purchases", "purchaseNo", "purchase", "شراء"], ["vouchers", "voucherNo", "voucher", "سند"], ["journalEntries", "journalNo", "journal", "قيد"], ["employeeLedger", "entryNo", "empEntry", "قيد موظف"]];
+// If this device issued a number another device issued at the same time, the record that is NOT yet in the cloud takes a new number.
+function dedupeNumbers(d, cloud) {
+  const notes = []; const counters = { ...(d.counters || {}) }; const out = { ...d };
+  NUMBERED.forEach(([col, field, ck, label]) => {
+    const list = d[col]; if (!Array.isArray(list)) return;
+    const cloudIds = new Set((cloud?.[col] || []).map((x) => x.id));
+    const seen = new Set(list.filter((x) => cloudIds.has(x.id)).map((x) => x[field]));
+    out[col] = list.map((x) => {
+      if (cloudIds.has(x.id)) return x;
+      const n = x[field];
+      if (n === undefined || n === null || !seen.has(n)) { seen.add(n); return x; }
+      const nn = (Number(counters[ck]) || 1000) + 1; counters[ck] = nn; seen.add(nn);
+      notes.push(`${label} ${n} ← ${nn}`);
+      return { ...x, [field]: nn };
+    });
+  });
+  out.counters = counters;
+  return { data: out, notes };
+}
+
 const PAYMENT_ACCOUNT_MAP = { "نقدي": "cash", "شبكة": "network", "تحويل بنكي": "bank" };
 const ROLE_STAGE_MAP = { "قصّاص": "القص", "خياط": "الخياطة", "كاوي": "الكي", "زرّار": "تركيب الأزرار" };
 const STAGE_ROLE_MAP = Object.fromEntries(Object.entries(ROLE_STAGE_MAP).map(([role, stage]) => [stage, role]));
@@ -101,14 +191,14 @@ const inputStyle = { width: "100%", boxSizing: "border-box", padding: "9px 12px"
 function TextInput(props) { return <input {...props} style={{ ...inputStyle, ...(props.style || {}) }} />; }
 function SelectInput({ options, ...props }) { return <select {...props} style={{ ...inputStyle, ...(props.style || {}) }}>{options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}</select>; }
 function Badge({ children, color = THEME.brass }) { return <span style={{ display: "inline-block", padding: "3px 10px", borderRadius: 20, fontSize: 12, fontWeight: 600, background: `${color}1a`, color }}>{children}</span>; }
-function Btn({ children, onClick, variant = "primary", small, type = "button", style, className }) {
+function Btn({ children, onClick, variant = "primary", small, type = "button", style, className, disabled }) {
   const styles = {
     primary: { background: THEME.ink, color: THEME.parchment },
     ghost: { background: "transparent", color: THEME.ink, border: `1px solid ${THEME.border}` },
     danger: { background: "transparent", color: THEME.red, border: `1px solid ${THEME.red}55` },
     brass: { background: THEME.brass, color: "#fff" },
   };
-  return <button type={type} className={className} onClick={onClick} style={{ ...styles[variant], border: styles[variant].border || "none", borderRadius: 7, padding: small ? "6px 10px" : "9px 16px", fontSize: small ? 13 : 14, fontWeight: 600, cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 6, fontFamily: "inherit", ...style }}>{children}</button>;
+  return <button type={type} className={className} onClick={onClick} disabled={disabled} style={{ ...styles[variant], border: styles[variant].border || "none", borderRadius: 7, padding: small ? "6px 10px" : "9px 16px", fontSize: small ? 13 : 14, fontWeight: 600, cursor: disabled ? "not-allowed" : "pointer", opacity: disabled ? 0.55 : 1, display: "inline-flex", alignItems: "center", gap: 6, fontFamily: "inherit", ...style }}>{children}</button>;
 }
 function Panel({ children, style }) { return <div style={{ background: THEME.panel, border: `1px solid ${THEME.border}`, borderTop: `3px solid ${THEME.brass}`, borderRadius: 8, padding: 20, ...style }}>{children}</div>; }
 function Modal({ title, onClose, children, wide, width }) {
@@ -951,16 +1041,9 @@ function CustomersView({ data, update, canEdit, currentUser }) {
   const save = (values) => {
     const list = [...data.customers];
     if (modal.mode === "add") {
-      const freed = [...(data.freedCustomerCodes || [])].sort((a, b) => a - b);
-      if (freed.length > 0) {
-        const reusedCode = freed.shift();
-        list.push({ id: uid("cust"), rating: 5, code: reusedCode, ...values });
-        update({ customers: list, freedCustomerCodes: freed });
-      } else {
-        const nextCode = (data.counters?.customer || 1000) + 1;
-        list.push({ id: uid("cust"), rating: 5, code: nextCode, ...values });
-        update({ customers: list, counters: { ...data.counters, customer: nextCode } });
-      }
+      const nextCode = (data.counters?.customer || 1000) + 1;
+      list.push({ id: uid("cust"), rating: 5, code: nextCode, ...values });
+      update({ customers: list, counters: { ...data.counters, customer: nextCode } });
     } else {
       const i = list.findIndex((c) => c.id === values.id); list[i] = values;
       update({ customers: list });
@@ -977,7 +1060,7 @@ function CustomersView({ data, update, canEdit, currentUser }) {
       <CrudSection icon={Users} title="إدارة العملاء" addLabel="عميل جديد" columns={["الكود", "الاسم", "الجوال", "عدد الطلبات", "نقاط الولاء", "التقييم", "المتبقي عليه", ""]} items={data.customers} searchKeys={["name", "phone", "code"]}
         onAdd={canEdit ? () => setModal({ mode: "add", values: {} }) : undefined}
         onEdit={canEdit ? (it) => setModal({ mode: "edit", values: it }) : undefined}
-        onDelete={canEdit ? (it) => update({ customers: data.customers.filter((c) => c.id !== it.id), freedCustomerCodes: [...(data.freedCustomerCodes || []), it.code].filter((v, i, arr) => v !== undefined && arr.indexOf(v) === i), auditLog: [...(data.auditLog || []), logEntry(currentUser, "حذف عميل", it.name)] }) : undefined}
+        onDelete={canEdit ? (it) => update({ customers: data.customers.filter((c) => c.id !== it.id), auditLog: [...(data.auditLog || []), logEntry(currentUser, "حذف عميل", it.name)] }) : undefined}
         renderRow={(it) => {
           const custOrders = data.orders.filter((o) => o.customerId === it.id);
           const spend = custOrders.reduce((s, o) => s + (Number(o.price) || 0), 0);
@@ -2539,7 +2622,7 @@ function StorageUsagePanel({ data }) {
   );
 }
 
-function ShopSettingsView({ data, update, canEdit }) {
+function ShopSettingsView({ data, update, canEdit, backupApi, currentUser }) {
   const [values, setValues] = useState(data.shopSettings || {});
   const [saved, setSaved] = useState(false);
   const fileRef = useRef(null);
@@ -2665,7 +2748,107 @@ function ShopSettingsView({ data, update, canEdit }) {
         </div>
       </Panel>
       <PrintTemplatesPanel data={data} update={update} />
+      {backupApi && <BackupPanel backupApi={backupApi} currentUser={currentUser} />}
     </div>
+  );
+}
+
+// ---------- Backups (automatic daily + manual + restore) ----------
+const BACKUP_KIND_LABEL = { auto: "تلقائية يومية", manual: "يدوية", prerestore: "قبل استرجاع" };
+function downloadJson(filename, obj) {
+  const blob = new Blob([JSON.stringify(obj)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a"); a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+function BackupPanel({ backupApi, currentUser }) {
+  const [rows, setRows] = useState(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState("");
+  const cloudOk = !!(typeof window !== "undefined" && window.cloudBackups);
+  const refresh = async () => {
+    if (!cloudOk) { setRows([]); return; }
+    try { setRows(await backupApi.list()); setError(""); }
+    catch (e) { setRows([]); setError(e?.message || String(e)); }
+  };
+  useEffect(() => { refresh(); }, []);
+  const kindOf = (r) => r.meta?.kind || (r.id.startsWith("backup-auto") ? "auto" : r.id.startsWith("backup-prerestore") ? "prerestore" : "manual");
+  const createNow = async () => {
+    setBusy("create");
+    try { await backupApi.create("manual", currentUser); await refresh(); }
+    catch (e) { setError(e?.message || String(e)); }
+    setBusy("");
+  };
+  const restoreFrom = async (snap, label) => {
+    const c = snap?.orders ? `${(snap.orders || []).length} طلب، ${(snap.customers || []).length} عميل، ${(snap.vouchers || []).length} سند` : "";
+    if (!window.confirm(`استرجاع النسخة: ${label}\n${c}\n\nسيتم استبدال كل بيانات المحل الحالية بهذه النسخة (مع حفظ نسخة من الوضع الحالي قبل الاسترجاع، وأرقام الفواتير والسندات لن ترجع للخلف). متابعة؟`)) return;
+    setBusy("restore");
+    try {
+      if (cloudOk) { try { await backupApi.create("prerestore", currentUser); } catch (e) { if (!window.confirm("تعذّر حفظ نسخة من الوضع الحالي قبل الاسترجاع. المتابعة بدونها؟")) { setBusy(""); return; } } }
+      await backupApi.restore(snap);
+    } catch (e) { setError(e?.message || String(e)); setBusy(""); }
+  };
+  const restoreCloud = async (r) => {
+    setBusy(r.id);
+    try { const payload = await backupApi.get(r.id); setBusy(""); await restoreFrom(payload.snapshot || payload, new Date(r.meta?.createdAt || r.updated_at).toLocaleString("ar-SA")); }
+    catch (e) { setError(e?.message || String(e)); setBusy(""); }
+  };
+  const downloadCloud = async (r) => {
+    setBusy(r.id);
+    try { const payload = await backupApi.get(r.id); downloadJson(`${r.id}.json`, payload); } catch (e) { setError(e?.message || String(e)); }
+    setBusy("");
+  };
+  const removeCloud = async (r) => {
+    if (!window.confirm("حذف هذه النسخة الاحتياطية نهائيًا؟")) return;
+    setBusy(r.id);
+    try { await backupApi.remove(r.id); await refresh(); } catch (e) { setError(e?.message || String(e)); }
+    setBusy("");
+  };
+  const downloadNow = () => { const snap = backupApi.current(); if (snap) downloadJson(`tailor-shop-backup-${todayStr()}.json`, { meta: { kind: "manual", createdAt: new Date().toISOString(), by: currentUser }, snapshot: snap }); };
+  const pickFile = (e) => {
+    const file = e.target.files[0]; if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try { const obj = JSON.parse(reader.result); const snap = obj.snapshot || obj; if (!snap || !Array.isArray(snap.orders) || !Array.isArray(snap.customers)) { alert("الملف ليس نسخة احتياطية صالحة لهذا البرنامج"); return; } restoreFrom(snap, `ملف ${file.name}`); }
+      catch (err) { alert("تعذّر قراءة الملف: " + err.message); }
+    };
+    reader.readAsText(file); e.target.value = "";
+  };
+  const newestAuto = (rows || []).find((r) => kindOf(r) === "auto");
+  const ageDays = newestAuto ? (Date.now() - new Date(newestAuto.meta?.createdAt || newestAuto.updated_at).getTime()) / 86400000 : null;
+  return (
+    <Panel style={{ marginTop: 20 }}>
+      <div style={{ fontWeight: 700, fontSize: 16, marginBottom: 4 }}>النسخ الاحتياطي والاسترجاع</div>
+      <div style={{ fontSize: 12.5, color: "#7A7061", marginBottom: 12 }}>
+        تؤخذ نسخة تلقائية مرة كل يوم عند فتح البرنامج (نحتفظ بآخر 7)، ويمكنك أخذ نسخة يدوية (آخر 5) أو تنزيل نسخة على جهازك. الاسترجاع يحفظ أولًا نسخة من الوضع الحالي.
+      </div>
+      {!cloudOk && <div style={{ background: "#FFF4E0", border: "1px solid #E8C98A", padding: 10, borderRadius: 6, fontSize: 13, marginBottom: 10 }}>النسخ السحابية غير متاحة في هذا الإصدار من الاتصال. استخدم التنزيل والرفع من ملف.</div>}
+      {error && <div style={{ background: "#FCEBEB", border: "1px solid #E5A5A5", padding: 10, borderRadius: 6, fontSize: 13, marginBottom: 10 }}>تعذّر الوصول لنسخ السحابة: {error}<div style={{ marginTop: 4 }}>إن كان الخطأ صلاحيات، نفّذ ما في ملف <b>SUPABASE_BACKUP_SETUP.md</b> مرة واحدة في Supabase. وفي الأثناء يمكنك استخدام «تنزيل نسخة الآن».</div></div>}
+      {cloudOk && !error && rows && (ageDays === null || ageDays > 2) && <div style={{ background: "#FFF4E0", border: "1px solid #E8C98A", padding: 10, borderRadius: 6, fontSize: 13, marginBottom: 10 }}>{ageDays === null ? "لا توجد نسخة تلقائية بعد." : "آخر نسخة تلقائية قبل أكثر من يومين."} تُؤخذ تلقائيًا عند فتح البرنامج؛ يمكنك أخذ نسخة يدوية الآن.</div>}
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
+        {cloudOk && <Btn variant="brass" onClick={createNow} disabled={!!busy}>{busy === "create" ? "جارٍ الحفظ…" : "نسخة احتياطية الآن"}</Btn>}
+        <Btn variant="ghost" onClick={downloadNow}>تنزيل نسخة على جهازي</Btn>
+        <label style={{ display: "inline-flex", alignItems: "center", gap: 6, cursor: "pointer", border: `1px solid ${THEME.border}`, borderRadius: 6, padding: "8px 12px", fontSize: 14, background: "#fff" }}><Upload size={14} />استرجاع من ملف<input type="file" accept=".json,application/json" onChange={pickFile} style={{ display: "none" }} /></label>
+      </div>
+      {cloudOk && (rows === null ? <div style={{ fontSize: 13 }}>جارٍ التحميل…</div> : rows.length === 0 ? <EmptyState text="لا توجد نسخ محفوظة في السحابة بعد" /> : (
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+          <thead><tr style={{ background: "#EFE7D6" }}><th style={{ padding: 8, textAlign: "right" }}>التاريخ</th><th style={{ padding: 8, textAlign: "right" }}>النوع</th><th style={{ padding: 8, textAlign: "right" }}>المحتوى</th><th style={{ padding: 8 }}></th></tr></thead>
+          <tbody>
+            {rows.map((r) => { const m = r.meta || {}; const c = m.counts || {}; return (
+              <tr key={r.id} style={{ borderTop: `1px solid ${THEME.border}` }}>
+                <td style={{ padding: 8 }}>{new Date(m.createdAt || r.updated_at).toLocaleString("ar-SA")}</td>
+                <td style={{ padding: 8 }}><Badge color={kindOf(r) === "auto" ? THEME.teal : THEME.brass}>{BACKUP_KIND_LABEL[kindOf(r)]}</Badge>{m.by ? <span style={{ fontSize: 11.5, color: "#8A8071" }}> {m.by}</span> : null}</td>
+                <td style={{ padding: 8, fontSize: 12 }}>{c.orders ?? "—"} طلب · {c.customers ?? "—"} عميل · {c.vouchers ?? "—"} سند</td>
+                <td style={{ padding: 8, whiteSpace: "nowrap" }}>
+                  <Btn small variant="ghost" disabled={!!busy} onClick={() => restoreCloud(r)}>استرجاع</Btn>{" "}
+                  <Btn small variant="ghost" disabled={!!busy} onClick={() => downloadCloud(r)}>تنزيل</Btn>{" "}
+                  <Btn small variant="danger" disabled={!!busy} onClick={() => removeCloud(r)}>حذف</Btn>
+                </td>
+              </tr>); })}
+          </tbody>
+        </table>
+      ))}
+    </Panel>
   );
 }
 
@@ -2881,15 +3064,38 @@ export default function App() {
   const [hasPendingSync, setHasPendingSync] = useState(false);
   const [pwModal, setPwModal] = useState(null);
   const dataForSyncRef = useRef(null);
+  const latestRef = useRef(null);   // newest local state (updates are applied to this, never to a stale render)
+  const baseRef = useRef(null);     // last state known to be in the cloud (merge base)
+  const saveChain = useRef(Promise.resolve());
+  const savingRef = useRef(0);
+
+  // Serialised, merge-safe save (see mergeData). Every call saves whatever latestRef holds when its turn comes.
+  const persist = () => {
+    savingRef.current += 1;
+    saveChain.current = saveChain.current.then(async () => {
+      try {
+        if (typeof navigator !== "undefined" && !navigator.onLine) { setHasPendingSync(true); return; }
+        let cloud = null;
+        try { const r = await window.storage.get(STORAGE_KEY); cloud = JSON.parse(r.value); } catch (e) { cloud = null; }
+        let merged = latestRef.current, notes = [];
+        if (cloud && baseRef.current) {
+          const dd = dedupeNumbers(mergeData(baseRef.current, latestRef.current, cloud), cloud);
+          merged = normalizeCounters(dd.data); notes = dd.notes;
+        }
+        latestRef.current = merged; dataForSyncRef.current = merged; setData(merged);
+        await window.storage.set(STORAGE_KEY, JSON.stringify(merged), false);
+        baseRef.current = merged; setHasPendingSync(false);
+        if (notes.length) alert("تنبيه: كان جهاز آخر قد استخدم نفس الرقم في نفس اللحظة، فتم ترقيم المستند الجديد برقم تالٍ:\n" + notes.join("\n"));
+      } catch (e) {
+        if (typeof navigator !== "undefined" && !navigator.onLine) { setHasPendingSync(true); return; }
+        alert("⚠ فشل حفظ آخر تغيير بشكل دائم!\nتفاصيل الخطأ: " + (e?.message || String(e)) + "\nالتغيير ظاهر لك الآن مؤقتًا لكن قد يختفي عند إعادة تحميل الصفحة.");
+      } finally { savingRef.current -= 1; }
+    });
+    return saveChain.current;
+  };
 
   React.useEffect(() => {
-    const goOnline = async () => {
-      setIsOnline(true);
-      if (dataForSyncRef.current) {
-        try { await window.storage.set(STORAGE_KEY, JSON.stringify(dataForSyncRef.current), false); setHasPendingSync(false); }
-        catch (e) { /* still failing — stays pending, will retry on next reconnect or next edit */ }
-      }
-    };
+    const goOnline = () => { setIsOnline(true); if (latestRef.current) persist(); };
     const goOffline = () => setIsOnline(false);
     window.addEventListener("online", goOnline);
     window.addEventListener("offline", goOffline);
@@ -2900,6 +3106,7 @@ export default function App() {
     (async () => {
       try {
         const res = await window.storage.get(STORAGE_KEY); const parsed = JSON.parse(res.value);
+        baseRef.current = JSON.parse(res.value);
         if (!parsed.journalEntries) parsed.journalEntries = [];
         if (!parsed.appointments) parsed.appointments = [];
         if (!parsed.shopSettings) parsed.shopSettings = seedData().shopSettings;
@@ -2911,7 +3118,7 @@ export default function App() {
           if (parsed.shopSettings.reviewLink === undefined) parsed.shopSettings.reviewLink = "";
         }
         if (!parsed.fabricThresholds) parsed.fabricThresholds = {};
-        if (!parsed.freedCustomerCodes) parsed.freedCustomerCodes = [];
+        parsed.freedCustomerCodes = [];
         if (!parsed.embroideryTypes) parsed.embroideryTypes = seedData().embroideryTypes;
         else if (parsed.embroideryTypes.length && typeof parsed.embroideryTypes[0] === "string") parsed.embroideryTypes = parsed.embroideryTypes.map((n) => ({ id: uid("emb"), name: n }));
         if (!parsed.counters) parsed.counters = { customer: 1000, order: 1000, group: 1000 };
@@ -2932,38 +3139,34 @@ export default function App() {
         { let vn = parsed.counters.voucher; parsed.vouchers = parsed.vouchers.map((v) => v.voucherNo ? v : (vn += 1, { ...v, voucherNo: vn })); parsed.counters.voucher = vn; }
         { let jn = parsed.counters.journal; parsed.journalEntries = parsed.journalEntries.map((j) => j.journalNo ? j : (jn += 1, { ...j, journalNo: jn })); parsed.counters.journal = jn; }
         if (parsed.users) parsed.users = parsed.users.map((u) => u.permissions && u.permissions.settings ? u : { ...u, permissions: { ...u.permissions, settings: u.role === "مدير عام" ? { view: true, edit: true } : { view: false, edit: false } } });
-        setData(parsed);
+        const loaded = normalizeCounters(parsed);
+        latestRef.current = loaded; dataForSyncRef.current = loaded;
+        setData(loaded);
       }
-      catch (e) { setData(seedData()); }
+      catch (e) { const seed = seedData(); latestRef.current = seed; setData(seed); }
       try { const s = await window.storage.get(SESSION_KEY); const parsed = JSON.parse(s.value); setSessionUserId(parsed.userId || null); }
       catch (e) { setSessionUserId(null); }
       setSessionLoaded(true);
     })();
   }, []);
 
-  const update = async (patch) => {
-    const next = { ...data, ...patch };
+  const update = (patch) => {
+    const next = normalizeCounters({ ...(latestRef.current || data), ...patch });
+    latestRef.current = next; dataForSyncRef.current = next;
     setData(next);
-    dataForSyncRef.current = next;
-    if (typeof navigator !== "undefined" && !navigator.onLine) { setHasPendingSync(true); return; }
-    try { await window.storage.set(STORAGE_KEY, JSON.stringify(next), false); setHasPendingSync(false); }
-    catch (e) {
-      if (typeof navigator !== "undefined" && !navigator.onLine) { setHasPendingSync(true); return; }
-      alert("⚠ فشل حفظ آخر تغيير بشكل دائم!\nتفاصيل الخطأ: " + (e?.message || String(e)) + "\nالتغيير ظاهر لك الآن مؤقتًا لكن قد يختفي عند إعادة تحميل الصفحة.");
-    }
+    return persist();
   };
 
   const handleLogin = (userId) => {
     setSessionUserId(userId);
     window.storage.set(SESSION_KEY, JSON.stringify({ userId }), false).catch(() => {});
-    setData((prev) => {
-      if (!prev) return prev;
+    const prev = latestRef.current;
+    if (prev) {
       const now = new Date().toLocaleString("ar-SA");
       const next = { ...prev, users: prev.users.map((u) => u.id === userId ? { ...u, loginCount: (u.loginCount || 0) + 1, lastLogin: now, lastSeen: new Date().toISOString() } : u) };
-      dataForSyncRef.current = next;
-      window.storage.set(STORAGE_KEY, JSON.stringify(next), false).catch(() => {});
-      return next;
-    });
+      latestRef.current = next; dataForSyncRef.current = next; setData(next);
+      persist();
+    }
   };
   const handleLogout = () => {
     setSessionUserId(null);
@@ -2974,13 +3177,10 @@ export default function App() {
   React.useEffect(() => {
     if (!sessionUserId) return;
     const beat = () => {
-      setData((prev) => {
-        if (!prev) return prev;
-        const next = { ...prev, users: prev.users.map((u) => u.id === sessionUserId ? { ...u, lastSeen: new Date().toISOString() } : u) };
-        dataForSyncRef.current = next;
-        window.storage.set(STORAGE_KEY, JSON.stringify(next), false).catch(() => {});
-        return next;
-      });
+      const prev = latestRef.current; if (!prev) return;
+      const next = { ...prev, users: prev.users.map((u) => u.id === sessionUserId ? { ...u, lastSeen: new Date().toISOString() } : u) };
+      latestRef.current = next; dataForSyncRef.current = next; setData(next);
+      persist();
     };
     const interval = setInterval(beat, 60000);
     return () => clearInterval(interval);
@@ -2992,15 +3192,72 @@ export default function App() {
   React.useEffect(() => {
     if (!sessionUserId) return;
     const interval = setInterval(async () => {
-      if (hasPendingSync) return;
+      if (hasPendingSync || savingRef.current > 0) return;
       try {
         const res = await window.storage.get(STORAGE_KEY);
-        const fresh = JSON.parse(res.value);
-        setData((prev) => (prev && JSON.stringify(prev) === res.value) ? prev : fresh);
+        const cloud = JSON.parse(res.value);
+        if (savingRef.current > 0 || !latestRef.current) return;
+        if (baseRef.current && deepEq(cloud, baseRef.current)) return;
+        const merged = normalizeCounters(mergeData(baseRef.current, latestRef.current, cloud));
+        baseRef.current = cloud;
+        if (!deepEq(merged, latestRef.current)) { latestRef.current = merged; dataForSyncRef.current = merged; setData(merged); }
       } catch (e) { /* ignore transient errors */ }
     }, 25000);
     return () => clearInterval(interval);
   }, [sessionUserId, hasPendingSync]);
+
+  // ---- Backups (cloud copies live in extra rows of the same Supabase table; see main.jsx) ----
+  const BACKUP_LIMITS = { auto: 7, manual: 5, prerestore: 3 };
+  const backupApi = {
+    current: () => latestRef.current,
+    async create(kind = "manual", by = "") {
+      const snap = latestRef.current; if (!snap) throw new Error("لا توجد بيانات للنسخ");
+      if (!window.cloudBackups) throw new Error("النسخ السحابية غير متاحة");
+      const id = kind === "auto" ? `backup-auto-${todayStr()}` : `backup-${kind}-${Date.now()}`;
+      const count = (k) => (snap[k] || []).length;
+      const meta = { kind, by, createdAt: new Date().toISOString(), counts: { orders: count("orders"), customers: count("customers"), vouchers: count("vouchers"), employees: count("employees"), suppliers: count("suppliers"), purchases: count("purchases") } };
+      await window.cloudBackups.put(id, { meta, snapshot: snap });
+      try { await backupApi.prune(); } catch (e) { /* pruning is best-effort */ }
+      return id;
+    },
+    list: () => window.cloudBackups.list(),
+    get: (id) => window.cloudBackups.get(id),
+    remove: (id) => window.cloudBackups.remove(id),
+    async prune() {
+      const rows = await window.cloudBackups.list(); const seen = {};
+      for (const r of rows) {
+        const kind = r.meta?.kind || (r.id.startsWith("backup-auto") ? "auto" : r.id.startsWith("backup-prerestore") ? "prerestore" : "manual");
+        seen[kind] = (seen[kind] || 0) + 1;
+        if (seen[kind] > (BACKUP_LIMITS[kind] || 5)) await window.cloudBackups.remove(r.id);
+      }
+    },
+    // Replaces the shop data with a snapshot. Counters never go backwards, so numbers already issued are not reused.
+    async restore(snap) {
+      const cur = latestRef.current || {};
+      const counters = { ...(snap.counters || {}) };
+      Object.keys(cur.counters || {}).forEach((k) => { counters[k] = Math.max(Number(counters[k]) || 0, Number(cur.counters[k]) || 0); });
+      const next = normalizeCounters({ ...snap, counters });
+      latestRef.current = next; dataForSyncRef.current = next; baseRef.current = null; setData(next);
+      await persist();
+      // persist() sets baseRef only after a successful cloud write — never reload (and lose the restore) if it failed.
+      if (!baseRef.current) throw new Error("تعذّر حفظ البيانات المسترجَعة في السحابة. لم يتم الاسترجاع، تحقق من الاتصال وأعد المحاولة.");
+      window.location.reload();
+    },
+  };
+  React.useEffect(() => {
+    if (!sessionUserId) return;
+    let stopped = false;
+    const run = async () => {
+      try {
+        if (stopped || !window.cloudBackups || !latestRef.current || (typeof navigator !== "undefined" && !navigator.onLine)) return;
+        const rows = await window.cloudBackups.list();
+        if (rows.some((r) => r.id === `backup-auto-${todayStr()}`)) return;
+        await backupApi.create("auto", "تلقائي");
+      } catch (e) { /* shown in Settings → النسخ الاحتياطي */ }
+    };
+    const t = setTimeout(run, 20000); const i = setInterval(run, 3600000);
+    return () => { stopped = true; clearTimeout(t); clearInterval(i); };
+  }, [sessionUserId]);
 
   if (!data || !sessionLoaded) return <div style={{ padding: 40, fontFamily: "Tajawal, sans-serif" }}>جارِ التحميل...</div>;
   applyTheme(data.shopSettings?.appTheme);
@@ -3027,7 +3284,7 @@ export default function App() {
     suppliers: <SuppliersView data={data} update={update} canEdit={canEdit} />,
     finance: <FinanceView data={data} update={update} canEdit={canEdit} currentUser={activeUser.name} />,
     users: <UsersView data={data} update={update} canEdit={canEdit} currentUser={activeUser.name} />,
-    settings: <ShopSettingsView data={data} update={update} canEdit={canEdit} />,
+    settings: <ShopSettingsView data={data} update={update} canEdit={canEdit} backupApi={backupApi} currentUser={activeUser.name} />,
     reports: <ReportsView data={data} />,
   };
 
