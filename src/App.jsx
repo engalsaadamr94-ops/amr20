@@ -4,7 +4,7 @@ import JsBarcode from "jsbarcode";
 import { Html5QrcodeScanner, Html5QrcodeSupportedFormats } from "html5-qrcode";
 import {
   LayoutDashboard, Users, ShoppingBag, Shirt, Receipt, Briefcase,
-  Truck, Wallet, ShieldCheck, BarChart3, Plus, Trash2, Pencil,
+  Truck, Wallet, ShieldCheck, BarChart3, Plus, Trash2, Pencil, Check,
   Printer, X, Search, Package, Building2, Star, ChevronLeft, ScanLine, Upload, CalendarClock, Store
 } from "lucide-react";
 
@@ -1718,6 +1718,18 @@ function employeeStatement(data, e) {
   const withRunning = rows.map((r) => { running += r.inc - r.dec; return { ...r, running: round2(running) }; });
   return { rows: withRunning, balance: round2(running) };
 }
+// An employee can work in several branches: e.branches is the full list, e.branch is kept as the primary one.
+const empBranches = (data, e) => (Array.isArray(e?.branches) && e.branches.length ? e.branches : [e?.branch || data.branches[0]?.id]).filter(Boolean);
+// Share (0..1) of an employee's salary/bonus that belongs to a given branch. Uses the percentages
+// entered in his profile (e.branchShares); falls back to an equal split when none were entered.
+function empBranchWeight(data, e, branchId) {
+  const brs = empBranches(data, e);
+  if (!brs.includes(branchId)) return 0;
+  const sh = e?.branchShares || {};
+  const total = brs.reduce((t, id) => t + (Number(sh[id]) || 0), 0);
+  return total > 0 ? (Number(sh[branchId]) || 0) / total : 1 / brs.length;
+}
+const equalShares = (ids) => { const o = {}; ids.forEach((id, i) => { o[id] = i === 0 ? round2(100 - round2(100 / ids.length) * (ids.length - 1)) : round2(100 / ids.length); }); return o; };
 const employeeBalance = (data, e) => employeeStatement(data, e).balance;
 function payTypeText(e) {
   const p = [];
