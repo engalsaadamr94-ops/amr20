@@ -21,6 +21,17 @@ function applyTheme(name) { Object.assign(THEME, PALETTES[name] || PALETTES.clas
 
 const uid = (p = "id") => `${p}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 const logEntry = (user, action, details) => ({ id: uid("log"), at: new Date().toLocaleString("ar-SA"), user: user || "غير معروف", action, details: details || "" });
+const todayStr = () => new Date().toISOString().slice(0, 10);
+const round2 = (n) => Math.round((Number(n) || 0) * 100) / 100;
+const fmtNum = (n) => (Number(n) || 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
+// Sequential numeric counters (vouchers, journal entries, employee ledger entries ...).
+// Returns the new number plus the updated counters object to be saved together with the record.
+const nextCounter = (counters, key, start = 1000) => { const no = (Number(counters?.[key]) || start) + 1; return { no, counters: { ...(counters || {}), [key]: no } }; };
+// Builds a voucher with a purely numeric number (1001, 1002 ...) instead of a random id fragment.
+function buildVoucher(counters, fields, createdBy) {
+  const { no, counters: c } = nextCounter(counters, "voucher");
+  return { voucher: { id: uid("v"), voucherNo: no, createdAt: new Date().toISOString(), createdBy: createdBy || "", ...fields }, counters: c };
+}
 const PAYMENT_ACCOUNT_MAP = { "نقدي": "cash", "شبكة": "network", "تحويل بنكي": "bank" };
 const ROLE_STAGE_MAP = { "قصّاص": "القص", "خياط": "الخياطة", "كاوي": "الكي", "زرّار": "تركيب الأزرار" };
 const STAGE_ROLE_MAP = Object.fromEntries(Object.entries(ROLE_STAGE_MAP).map(([role, stage]) => [stage, role]));
@@ -70,7 +81,9 @@ const seedData = () => ({
     { id: "network", name: "الشبكة", type: "شبكة", balance: 0 },
   ],
   vouchers: [], journalEntries: [], appointments: [],
-  counters: { customer: 1000, order: 1000, group: 1000, purchase: 1000 },
+  counters: { customer: 1000, order: 1000, group: 1000, purchase: 1000, voucher: 1000, journal: 1000, empEntry: 5000 },
+  employeeLedger: [],
+  printSettings: { defaults: {}, customTemplates: [] },
   freedCustomerCodes: [],
   orderGroups: [],
   auditLog: [],
@@ -88,20 +101,20 @@ const inputStyle = { width: "100%", boxSizing: "border-box", padding: "9px 12px"
 function TextInput(props) { return <input {...props} style={{ ...inputStyle, ...(props.style || {}) }} />; }
 function SelectInput({ options, ...props }) { return <select {...props} style={{ ...inputStyle, ...(props.style || {}) }}>{options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}</select>; }
 function Badge({ children, color = THEME.brass }) { return <span style={{ display: "inline-block", padding: "3px 10px", borderRadius: 20, fontSize: 12, fontWeight: 600, background: `${color}1a`, color }}>{children}</span>; }
-function Btn({ children, onClick, variant = "primary", small, type = "button" }) {
+function Btn({ children, onClick, variant = "primary", small, type = "button", style, className }) {
   const styles = {
     primary: { background: THEME.ink, color: THEME.parchment },
     ghost: { background: "transparent", color: THEME.ink, border: `1px solid ${THEME.border}` },
     danger: { background: "transparent", color: THEME.red, border: `1px solid ${THEME.red}55` },
     brass: { background: THEME.brass, color: "#fff" },
   };
-  return <button type={type} onClick={onClick} style={{ ...styles[variant], border: styles[variant].border || "none", borderRadius: 7, padding: small ? "6px 10px" : "9px 16px", fontSize: small ? 13 : 14, fontWeight: 600, cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 6, fontFamily: "inherit" }}>{children}</button>;
+  return <button type={type} className={className} onClick={onClick} style={{ ...styles[variant], border: styles[variant].border || "none", borderRadius: 7, padding: small ? "6px 10px" : "9px 16px", fontSize: small ? 13 : 14, fontWeight: 600, cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 6, fontFamily: "inherit", ...style }}>{children}</button>;
 }
 function Panel({ children, style }) { return <div style={{ background: THEME.panel, border: `1px solid ${THEME.border}`, borderTop: `3px solid ${THEME.brass}`, borderRadius: 8, padding: 20, ...style }}>{children}</div>; }
-function Modal({ title, onClose, children, wide }) {
+function Modal({ title, onClose, children, wide, width }) {
   return (
-    <div style={{ position: "fixed", inset: 0, background: "#1a1712bb", zIndex: 50, display: "flex", alignItems: "flex-start", justifyContent: "center", padding: "40px 16px", overflowY: "auto" }} onClick={onClose}>
-      <div onClick={(e) => e.stopPropagation()} style={{ background: THEME.panel, borderRadius: 10, width: "100%", maxWidth: wide ? 820 : 460, padding: 24, border: `1px solid ${THEME.border}` }}>
+    <div className="modal-overlay" style={{ position: "fixed", inset: 0, background: "#1a1712bb", zIndex: 50, display: "flex", alignItems: "flex-start", justifyContent: "center", padding: "40px 16px", overflowY: "auto" }} onClick={onClose}>
+      <div className="modal-box" onClick={(e) => e.stopPropagation()} style={{ background: THEME.panel, borderRadius: 10, width: "100%", maxWidth: width || (wide ? 820 : 460), padding: 24, border: `1px solid ${THEME.border}` }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 18 }}>
           <h3 style={{ margin: 0, fontFamily: "Amiri, serif", fontSize: 22, color: THEME.ink }}>{title}</h3>
           <button onClick={onClose} style={{ background: "none", border: "none", cursor: "pointer", color: "#6B6255" }}><X size={20} /></button>
@@ -123,6 +136,17 @@ function toWhatsAppNumber(phone) {
 }
 function fillTemplate(template, vars) {
   return String(template || "").replace(/\{(\w+)\}/g, (_, k) => (vars[k] ?? ""));
+}
+// ---------- Password hashing (SHA-256 via the browser's built-in Web Crypto API) ----------
+async function hashPassword(pw) {
+  const enc = new TextEncoder().encode(String(pw));
+  const buf = await crypto.subtle.digest("SHA-256", enc);
+  return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+function looksHashed(pw) { return typeof pw === "string" && /^[a-f0-9]{64}$/.test(pw); }
+async function verifyPassword(input, stored) {
+  if (looksHashed(stored)) return (await hashPassword(input)) === stored;
+  return (stored || "") === input; // legacy plaintext account, not yet migrated
 }
 function buildWhatsAppLink(phone, message) {
   return `https://wa.me/${toWhatsAppNumber(phone)}?text=${encodeURIComponent(message)}`;
@@ -284,39 +308,570 @@ function AttachmentField({ value, onChange }) {
   );
 }
 
-function RecordPrintModal({ data, title, refLabel, refNo, rows, attachment, onClose }) {
+// ---------- Professional A4 print system ----------
+// Every printed document (invoices, vouchers, journal entries, statements) is rendered by <PrintSheet>,
+// styled by a template object. Built-in templates are listed below; users can duplicate any of them
+// (or start from scratch, with their own letterhead image) from "بيانات المحل" ← "قوالب الطباعة".
+const FONT_MAP = { tajawal: "Tajawal, sans-serif", amiri: "Amiri, serif", cairo: "Cairo, Tajawal, sans-serif" };
+const BUILTIN_TEMPLATES = [
+  { id: "classic", label: "كلاسيكي", builtin: true, accent: "#A9752E", font: "amiri", header: "line", frame: "single", table: "striped", showLogo: true, showSignatures: true },
+  { id: "modern", label: "عصري (شريط علوي)", builtin: true, accent: "#2E5A54", font: "tajawal", header: "band", frame: "none", table: "striped", showLogo: true, showSignatures: true },
+  { id: "elegant", label: "أنيق (إطار مزدوج ذهبي)", builtin: true, accent: "#B8860B", font: "amiri", header: "center", frame: "double", table: "plain", showLogo: true, showSignatures: true },
+  { id: "minimal", label: "مبسّط", builtin: true, accent: "#333333", font: "tajawal", header: "split", frame: "none", table: "plain", showLogo: true, showSignatures: true },
+  { id: "royal", label: "ملكي (أزرق رسمي)", builtin: true, accent: "#1F3A68", font: "cairo", header: "band", frame: "single", table: "grid", showLogo: true, showSignatures: true },
+  { id: "business", label: "تجاري (عنابي)", builtin: true, accent: "#7A1F2B", font: "cairo", header: "split", frame: "none", table: "grid", showLogo: true, showSignatures: true },
+];
+const DOC_TYPE_LABELS = [["invoice", "الفواتير وبطاقات الطلبات"], ["voucher", "السندات (قبض / صرف / مشتريات)"], ["journal", "قيود التحويل"], ["statement", "كشوفات الحساب (عملاء / موردين / موظفين)"]];
+const allTemplates = (data) => [...BUILTIN_TEMPLATES, ...(data.printSettings?.customTemplates || [])];
+function resolveTpl(data, docType, override) {
+  const all = allTemplates(data);
+  const id = override || data.printSettings?.defaults?.[docType] || "classic";
+  return all.find((t) => t.id === id) || all[0];
+}
+const hexAlpha = (c, a) => (/^#[0-9a-fA-F]{6}$/.test(c || "") ? c + a : c);
+
+function tplTable(t) {
+  const A = t.accent || "#A9752E";
+  const base = { width: "100%", borderCollapse: "collapse", fontSize: 12.5 };
+  if (t.table === "grid") return { table: { ...base, border: `1px solid ${A}` }, th: { padding: "7px 8px", textAlign: "right", background: hexAlpha(A, "26"), color: "#211D19", border: `1px solid ${A}`, fontWeight: 700 }, td: () => ({ padding: "6px 8px", border: `1px solid ${hexAlpha(A, "66")}` }) };
+  if (t.table === "plain") return { table: base, th: { padding: "7px 8px", textAlign: "right", borderBottom: `2px solid ${A}`, color: A, fontWeight: 700 }, td: () => ({ padding: "6px 8px", borderBottom: "1px solid #e6e1d6" }) };
+  return { table: base, th: { padding: "7px 8px", textAlign: "right", background: A, color: "#fff", fontWeight: 700 }, td: (i) => ({ padding: "6px 8px", background: i % 2 ? hexAlpha(A, "10") : "transparent", borderBottom: "1px solid #eee8da" }) };
+}
+function PTable({ tpl, columns, rows }) {
+  const T = tplTable(tpl);
   return (
-    <Modal title={title} onClose={onClose}>
-      <div style={{ border: `2px solid ${THEME.brass}`, borderRadius: 8, padding: 18 }}>
-        <div style={{ display: "flex", gap: 10, alignItems: "flex-start", justifyContent: "space-between" }}>
-          <div style={{ display: "flex", gap: 10 }}>
-            {data.shopSettings?.logo && <img src={data.shopSettings.logo} alt="" style={{ width: 40, height: 40, objectFit: "cover", borderRadius: 6, border: `1px solid ${THEME.border}` }} />}
-            <div>
-              <div style={{ fontFamily: "Amiri, serif", fontSize: 18 }}>{data.shopSettings?.name || "المحل"}</div>
-              {data.shopSettings?.phone && <div style={{ fontSize: 11, color: "#7A7061" }}>{data.shopSettings.phone}{data.shopSettings?.city ? ` — ${data.shopSettings.city}` : ""}</div>}
-              {(data.shopSettings?.crNumber || data.shopSettings?.taxNumber) && <div style={{ fontSize: 10.5, color: "#8A8071" }}>{data.shopSettings.crNumber && `س.ت: ${data.shopSettings.crNumber}`}{data.shopSettings.crNumber && data.shopSettings.taxNumber && " — "}{data.shopSettings.taxNumber && `ض.ق.م: ${data.shopSettings.taxNumber}`}</div>}
+    <table style={T.table}>
+      <thead style={{ display: "table-header-group" }}><tr>{columns.map((c) => <th key={c.key} style={{ ...T.th, textAlign: c.align || "right", width: c.width }}>{c.label}</th>)}</tr></thead>
+      <tbody>{rows.map((r, i) => <tr key={r.key ?? i} style={{ pageBreakInside: "avoid" }}>{columns.map((c) => <td key={c.key} style={{ ...T.td(i), textAlign: c.align || "right", fontWeight: c.bold ? 700 : 400 }}>{r[c.key]}</td>)}</tr>)}</tbody>
+    </table>
+  );
+}
+
+// Amount in Arabic words ("فقط ... لا غير") for vouchers.
+function tafqeet(num) {
+  const n = round2(num);
+  const riyals = Math.floor(n + 1e-9), halalas = Math.round((n - riyals) * 100);
+  if (riyals >= 1e12) return "";
+  const ONES = ["", "واحد", "اثنان", "ثلاثة", "أربعة", "خمسة", "ستة", "سبعة", "ثمانية", "تسعة", "عشرة", "أحد عشر", "اثنا عشر", "ثلاثة عشر", "أربعة عشر", "خمسة عشر", "ستة عشر", "سبعة عشر", "ثمانية عشر", "تسعة عشر"];
+  const TENS = ["", "", "عشرون", "ثلاثون", "أربعون", "خمسون", "ستون", "سبعون", "ثمانون", "تسعون"];
+  const HUND = ["", "مائة", "مائتان", "ثلاثمائة", "أربعمائة", "خمسمائة", "ستمائة", "سبعمائة", "ثمانمائة", "تسعمائة"];
+  const below1000 = (x) => {
+    const parts = []; const h = Math.floor(x / 100), r = x % 100;
+    if (h) parts.push(HUND[h]);
+    if (r) { if (r < 20) parts.push(ONES[r]); else { const o = r % 10, t = Math.floor(r / 10); parts.push(o ? `${ONES[o]} و${TENS[t]}` : TENS[t]); } }
+    return parts.join(" و");
+  };
+  const scales = [{ one: "ألف", two: "ألفان", few: "آلاف", many: "ألف" }, { one: "مليون", two: "مليونان", few: "ملايين", many: "مليون" }, { one: "مليار", two: "ملياران", few: "مليارات", many: "مليار" }];
+  const words = (x) => {
+    const groups = []; let rest = x; while (rest > 0) { groups.push(rest % 1000); rest = Math.floor(rest / 1000); }
+    const out = [];
+    for (let i = groups.length - 1; i >= 0; i--) {
+      const g = groups[i]; if (!g) continue;
+      if (i === 0) out.push(below1000(g));
+      else { const sc = scales[i - 1]; out.push(g === 1 ? sc.one : g === 2 ? sc.two : `${below1000(g)} ${g <= 10 ? sc.few : sc.many}`); }
+    }
+    return out.join(" و");
+  };
+  const unitText = (x, f) => { if (x === 1) return f[0]; if (x === 2) return f[1]; const l2 = x % 100; return `${words(x)} ${l2 >= 3 && l2 <= 10 ? f[2] : l2 >= 11 ? f[3] : f[4]}`; };
+  const parts = [];
+  if (riyals > 0) parts.push(unitText(riyals, ["ريال سعودي واحد", "ريالان سعوديان", "ريالات سعودية", "ريالاً سعوديًا", "ريال سعودي"]));
+  if (halalas > 0) parts.push(unitText(halalas, ["هللة واحدة", "هللتان", "هللات", "هللة", "هللة"]));
+  if (!parts.length) return "صفر ريال";
+  return `${parts.join(" و")} فقط لا غير`;
+}
+
+function TemplatePicker({ data, value, onChange, docType }) {
+  const cur = value || data.printSettings?.defaults?.[docType] || "classic";
+  return <SelectInput options={allTemplates(data).map((t) => ({ value: t.id, label: t.label }))} value={cur} onChange={(e) => onChange(e.target.value)} />;
+}
+
+function PrintSheet({ data, tpl, preview, title, docNo, docNoLabel = "رقم", date, meta, parties, children, totals, amount, notes, signatures, barcode, attachment, showBank = true, footerNote }) {
+  const t = tpl || BUILTIN_TEMPLATES[0];
+  const A = t.accent || "#A9752E";
+  const head = FONT_MAP[t.font] || FONT_MAP.tajawal;
+  const body = t.font === "amiri" ? FONT_MAP.tajawal : head;
+  const sh = data.shopSettings || {};
+  const printedAt = new Date().toLocaleDateString("ar-SA") + " " + new Date().toLocaleTimeString("ar-SA", { hour: "2-digit", minute: "2-digit" });
+  const shopLines = [[sh.phone, sh.city, sh.address].filter(Boolean).join(" — "), [sh.crNumber && `س.ت: ${sh.crNumber}`, sh.taxNumber && `الرقم الضريبي: ${sh.taxNumber}`].filter(Boolean).join(" — ")].filter(Boolean);
+  const shopName = sh.legalName || sh.name || "المحل";
+  const shopInfo = (light, center) => (
+    <div style={{ display: "flex", gap: 10, alignItems: "center", flexDirection: center ? "column" : "row", textAlign: center ? "center" : "right" }}>
+      {t.showLogo !== false && sh.logo && <img src={sh.logo} alt="" style={{ width: center ? 54 : 46, height: center ? 54 : 46, objectFit: "cover", borderRadius: 8, border: light ? "1px solid rgba(255,255,255,.6)" : `1px solid ${hexAlpha(A, "55")}` }} />}
+      <div>
+        <div style={{ fontFamily: head, fontSize: 21, fontWeight: 700, lineHeight: 1.25 }}>{shopName}</div>
+        {sh.legalName && sh.name && sh.legalName !== sh.name && <div style={{ fontSize: 12, opacity: 0.85 }}>{sh.name}</div>}
+        {shopLines.map((l, i) => <div key={i} style={{ fontSize: 11, opacity: 0.85 }}>{l}</div>)}
+      </div>
+    </div>
+  );
+  const titleBlock = (light, boxed) => (
+    <div style={{ textAlign: "center", minWidth: 150, ...(boxed ? { border: `1.5px solid ${A}`, borderRadius: 6, padding: "8px 14px" } : {}) }}>
+      <div style={{ fontFamily: head, fontSize: 24, fontWeight: 700, color: light ? "#fff" : A, lineHeight: 1.2 }}>{title}</div>
+      {docNo !== undefined && docNo !== "" && <div style={{ fontSize: 13, marginTop: 4, fontWeight: 700 }}>{docNoLabel}: <span style={{ letterSpacing: 0.5 }}>{docNo}</span></div>}
+      {date && <div style={{ fontSize: 12, marginTop: 2, opacity: 0.9 }}>التاريخ: {date}</div>}
+    </div>
+  );
+  let header;
+  if (t.headerImage) {
+    header = (
+      <div>
+        <img src={t.headerImage} alt="" style={{ width: "100%", display: "block" }} />
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 8, borderBottom: `2px solid ${A}`, paddingBottom: 8 }}>
+          <div style={{ fontFamily: head, fontSize: 22, fontWeight: 700, color: A }}>{title}</div>
+          <div style={{ textAlign: "left", fontSize: 12.5 }}>{docNo !== undefined && docNo !== "" && <div style={{ fontWeight: 700 }}>{docNoLabel}: {docNo}</div>}{date && <div>التاريخ: {date}</div>}</div>
+        </div>
+      </div>
+    );
+  } else if (t.header === "band") {
+    header = <div style={{ background: A, color: "#fff", borderRadius: 6, padding: "14px 18px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>{shopInfo(true)}{titleBlock(true)}</div>;
+  } else if (t.header === "center") {
+    header = (
+      <div style={{ textAlign: "center" }}>
+        {shopInfo(false, true)}
+        <div style={{ display: "flex", alignItems: "center", gap: 10, margin: "10px 0" }}><div style={{ flex: 1, height: 1, background: A }} /><div style={{ width: 8, height: 8, background: A, transform: "rotate(45deg)" }} /><div style={{ flex: 1, height: 1, background: A }} /></div>
+        {titleBlock(false, true)}
+      </div>
+    );
+  } else if (t.header === "split") {
+    header = <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", paddingBottom: 10, borderBottom: `1px solid ${A}` }}>{shopInfo(false)}{titleBlock(false, true)}</div>;
+  } else {
+    header = <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", paddingBottom: 10, borderBottom: `3px solid ${A}` }}>{shopInfo(false)}{titleBlock(false)}</div>;
+  }
+  const frameStyle = t.frame === "single" ? { border: `1.5px solid ${A}`, padding: "7mm" } : t.frame === "double" ? { border: `4px double ${A}`, padding: "7mm" } : { padding: 0 };
+  const card = (c, i) => (
+    <div key={i} style={{ border: `1px solid ${hexAlpha(A, "55")}`, borderTop: `3px solid ${A}`, borderRadius: 4, padding: "8px 10px", background: hexAlpha(A, "08") }}>
+      <div style={{ fontWeight: 700, color: A, marginBottom: 5, fontSize: 13 }}>{c.title}</div>
+      {(c.rows || []).map((r, j) => <div key={j} style={{ fontSize: 12.5, marginBottom: 2 }}>{r.label}: <b>{r.value}</b></div>)}
+      {(c.lines || []).map((l, j) => <div key={`l${j}`} style={{ fontSize: 12.5, marginBottom: 2 }}>{l}</div>)}
+    </div>
+  );
+  return (
+    <div className={preview ? "" : "printable"} style={{ width: preview ? "794px" : "210mm", minHeight: preview ? "1123px" : "297mm", background: "#fff", color: "#211D19", boxSizing: "border-box", padding: "10mm", margin: "0 auto", position: "relative", fontFamily: body, display: "flex", flexDirection: "column", boxShadow: preview ? "none" : "0 2px 10px rgba(0,0,0,.18)", overflow: "hidden" }}>
+      {t.watermark && <div style={{ position: "absolute", top: "42%", left: 0, right: 0, textAlign: "center", fontSize: 96, fontWeight: 700, color: A, opacity: 0.06, transform: "rotate(-28deg)", pointerEvents: "none", fontFamily: head }}>{t.watermark}</div>}
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", ...frameStyle }}>
+        {header}
+        {meta && meta.length > 0 && (
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 6, marginTop: 12 }}>
+            {meta.map((m, i) => <div key={i} style={{ background: hexAlpha(A, "10"), borderRadius: 4, padding: "6px 9px" }}><div style={{ fontSize: 10.5, color: "#7A7061" }}>{m.label}</div><div style={{ fontSize: 13, fontWeight: 700 }}>{m.value}</div></div>)}
+          </div>
+        )}
+        {amount !== undefined && amount !== null && (
+          <div style={{ marginTop: 12, border: `2px solid ${A}`, borderRadius: 6, padding: "10px 14px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 14, background: hexAlpha(A, "0c") }}>
+            <div style={{ fontSize: 12, color: "#5C5344" }}>المبلغ</div>
+            <div style={{ fontFamily: head, fontSize: 26, fontWeight: 700, color: A, whiteSpace: "nowrap" }}>{fmtNum(amount)} ر.س</div>
+            <div style={{ fontSize: 12.5, flex: 1, textAlign: "left" }}>{tafqeet(amount)}</div>
+          </div>
+        )}
+        {parties && parties.length > 0 && <div style={{ display: "grid", gridTemplateColumns: `repeat(${Math.min(parties.length, 2)}, 1fr)`, gap: 10, marginTop: 12 }}>{parties.map(card)}</div>}
+        <div style={{ marginTop: 14, flex: 1 }}>{children}</div>
+        {totals && totals.length > 0 && (
+          <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 12 }}>
+            <table style={{ width: "52%", borderCollapse: "collapse", fontSize: 13 }}>
+              <tbody>{totals.map((r, i) => <tr key={i} style={r.strong ? { background: A, color: "#fff", fontWeight: 700, fontSize: 14 } : {}}><td style={{ padding: "6px 10px", borderBottom: r.strong ? "none" : "1px solid #e6e1d6" }}>{r.label}</td><td style={{ padding: "6px 10px", textAlign: "left", borderBottom: r.strong ? "none" : "1px solid #e6e1d6", fontWeight: 700 }}>{r.value}</td></tr>)}</tbody>
+            </table>
+          </div>
+        )}
+        {notes && <div style={{ marginTop: 10, fontSize: 12, color: "#5C5344", borderRight: `3px solid ${A}`, padding: "2px 10px" }}>{notes}</div>}
+        {attachment?.dataUrl && attachment.type?.startsWith("image/") && (
+          <div style={{ marginTop: 12 }}><div style={{ fontWeight: 700, fontSize: 12.5, marginBottom: 4 }}>المرفق</div><img src={attachment.dataUrl} alt="" style={{ maxWidth: "100%", maxHeight: 260, borderRadius: 4, border: `1px solid ${THEME.border}` }} /></div>
+        )}
+        {barcode && <div style={{ textAlign: "center", marginTop: 10 }}><BarcodeSVG value={barcode} height={34} width={1.4} /></div>}
+        {t.showSignatures !== false && signatures && signatures.length > 0 && (
+          <div style={{ display: "grid", gridTemplateColumns: `repeat(${signatures.length}, 1fr)`, gap: 22, marginTop: 30, fontSize: 12.5, color: "#5C5344" }}>
+            {signatures.map((sg) => <div key={sg} style={{ textAlign: "center" }}><div style={{ borderBottom: "1px solid #8A8071", height: 30, marginBottom: 5 }} />{sg}</div>)}
+          </div>
+        )}
+        <div style={{ marginTop: 18, borderTop: `1px solid ${hexAlpha(A, "66")}`, paddingTop: 7, fontSize: 10.5, color: "#7A7061", textAlign: "center" }}>
+          {showBank && sh.bankName && <div>تحويل بنكي: {sh.bankName}{sh.iban ? ` — آيبان: ${sh.iban}` : ""}</div>}
+          {(t.footerText || footerNote) && <div style={{ fontSize: 11.5, color: "#5C5344", margin: "2px 0" }}>{t.footerText || footerNote}</div>}
+          {t.footerImage && <img src={t.footerImage} alt="" style={{ width: "100%", display: "block", margin: "4px 0" }} />}
+          <div>{[sh.website, `طُبع بتاريخ ${printedAt}`].filter(Boolean).join(" — ")}</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Preview stage shared by every print modal: template picker + print button + gray "desk" around the A4 sheet.
+function PrintStage({ data, docType, tplId, setTplId, children, extraControls }) {
+  return (
+    <>
+      <div className="no-print" style={{ display: "flex", gap: 10, alignItems: "flex-end", flexWrap: "wrap", marginBottom: 10 }}>
+        <div style={{ width: 250 }}><Field label="قالب الطباعة"><TemplatePicker data={data} docType={docType} value={tplId} onChange={setTplId} /></Field></div>
+        {extraControls}
+        <Btn variant="brass" onClick={() => window.print && window.print()} style={{ marginBottom: 12 }}><Printer size={15} />طباعة A4</Btn>
+      </div>
+      <div className="print-stage" style={{ background: "#E4DFD2", padding: 12, borderRadius: 8, overflowX: "auto" }}>{children}</div>
+    </>
+  );
+}
+
+function RecordPrintModal({ data, title, refLabel, refNo, rows, attachment, onClose, partyTitle, partyRows, signatures, docType = "voucher", amount, date }) {
+  const [tplId, setTplId] = useState(null);
+  const tpl = resolveTpl(data, docType, tplId);
+  return (
+    <Modal title={title} onClose={onClose} width={900}>
+      <PrintStage data={data} docType={docType} tplId={tplId} setTplId={setTplId}>
+        <PrintSheet data={data} tpl={tpl} title={title} docNo={refNo} docNoLabel="رقم" date={date}
+          meta={rows} amount={amount} attachment={attachment} signatures={signatures}
+          parties={partyRows && partyRows.length ? [{ title: partyTitle, rows: partyRows }] : undefined} barcode={refNo} />
+      </PrintStage>
+    </Modal>
+  );
+}
+
+// Resolves the "who received / who paid" party of a voucher into printable rows.
+// Looks the person up live (so edits to their data show up) and falls back to the
+// snapshot saved on the voucher itself when the record no longer exists.
+function voucherPartyInfo(data, v) {
+  const rows = [];
+  const add = (label, value) => { if (value !== undefined && value !== null && String(value).trim() !== "") rows.push({ label, value: String(value) }); };
+  const branchName = (id) => data.branches.find((b) => b.id === id)?.name;
+  let kind = v.partyType || "";
+  if (!kind && v.employeeId) kind = "موظف";
+  if (!kind && v.supplierId) kind = "مورد";
+  const order = v.orderId ? data.orders.find((o) => o.id === v.orderId) : null;
+  if (!kind && order) kind = "عميل";
+  const partyId = v.partyId || v.employeeId || v.supplierId || order?.customerId;
+  if (kind === "موظف") {
+    const e = data.employees.find((x) => x.id === partyId);
+    add("الاسم", e?.name || v.partyName); add("الصفة", "موظف" + (e?.role ? ` — ${e.role}` : "")); add("الجوال", e?.phone || v.partyPhone);
+    add("رقم الهوية / الإقامة", e?.idNumber); add("الفرع", e ? empBranches(data, e).map(branchName).filter(Boolean).join("، ") : "");
+  } else if (kind === "مورد") {
+    const sp = data.suppliers.find((x) => x.id === partyId);
+    add("الاسم", sp?.name || v.partyName); add("الصفة", "مورد" + (sp?.materialType ? ` — ${sp.materialType}` : "")); add("الجوال", sp?.phone || v.partyPhone);
+  } else if (kind === "عميل") {
+    const c = data.customers.find((x) => x.id === partyId);
+    add("الاسم", c?.name || v.partyName); add("الصفة", "عميل" + (c?.code ? ` — كود ${c.code}` : "")); add("الجوال", c?.phone || v.partyPhone);
+    if (order) add("رقم الطلب", `#${order.orderNo || order.id.slice(-6)}`);
+  } else if (kind === "أخرى" || v.partyName) {
+    add("الاسم", v.partyName); add("الجوال", v.partyPhone); add("الصفة", "جهة أخرى");
+  }
+  return rows;
+}
+
+function VoucherPrintModal({ data, voucher, onClose }) {
+  const isReceipt = voucher.type === "قبض";
+  const title = isReceipt ? "سند قبض" : "سند صرف";
+  const partyRows = voucherPartyInfo(data, voucher);
+  const created = voucher.createdAt ? new Date(voucher.createdAt).toLocaleTimeString("ar-SA", { hour: "2-digit", minute: "2-digit" }) : "";
+  return (
+    <RecordPrintModal data={data} title={title} refLabel={title} refNo={voucher.voucherNo || voucher.id.slice(-6)} attachment={voucher.attachment} onClose={onClose}
+      docType="voucher" date={`${voucher.date || "—"}${created ? " — " + created : ""}`} amount={Number(voucher.amount) || 0}
+      partyTitle={isReceipt ? "بيانات الدافع (المقبوض منه)" : "بيانات المستلم (المصروف له)"}
+      partyRows={partyRows.length ? partyRows : [{ label: isReceipt ? "المقبوض منه" : "المستلم", value: "غير محدد" }]}
+      signatures={isReceipt ? ["توقيع الدافع", "توقيع المحاسب / أمين الصندوق"] : ["توقيع المستلم", "توقيع المحاسب / أمين الصندوق"]}
+      rows={[
+        { label: "الحساب", value: data.financeAccounts.find((a) => a.id === voucher.accountId)?.name || "—" },
+        { label: "الفرع", value: data.branches.find((b) => b.id === voucher.branch)?.name || "—" },
+        { label: "التصنيف", value: voucher.category || "—" },
+        { label: "البيان", value: voucher.description || "—" },
+        ...(voucher.createdBy ? [{ label: "أنشأه", value: voucher.createdBy }] : []),
+      ]} />
+  );
+}
+
+// Lets a voucher say who it was received from / paid to (customer, supplier, employee or someone else).
+function PartyPicker({ data, values, setValues }) {
+  const t = values.partyType || "";
+  const list = t === "عميل" ? data.customers : t === "مورد" ? data.suppliers : t === "موظف" ? data.employees : [];
+  const pick = (id) => { const item = list.find((x) => x.id === id); setValues({ ...values, partyId: id, partyName: item?.name || "", partyPhone: item?.phone || "" }); };
+  return (
+    <>
+      <Field label={values.type === "صرف" ? "المستلم (المصروف له)" : "المقبوض منه"}>
+        <SelectInput options={[{ value: "", label: "بدون تحديد" }, ...["عميل", "مورد", "موظف", "أخرى"].map((x) => ({ value: x, label: x }))]} value={t} onChange={(e) => setValues({ ...values, partyType: e.target.value, partyId: "", partyName: "", partyPhone: "" })} />
+      </Field>
+      {["عميل", "مورد", "موظف"].includes(t) && (
+        <Field label={`اختر ${t}`}>
+          <SelectInput options={[{ value: "", label: "— اختر —" }, ...list.map((x) => ({ value: x.id, label: x.name }))]} value={values.partyId || ""} onChange={(e) => pick(e.target.value)} />
+        </Field>
+      )}
+      {t === "أخرى" && (
+        <>
+          <Field label="الاسم"><TextInput value={values.partyName || ""} onChange={(e) => setValues({ ...values, partyName: e.target.value })} /></Field>
+          <Field label="الجوال"><TextInput value={values.partyPhone || ""} onChange={(e) => setValues({ ...values, partyPhone: e.target.value })} /></Field>
+        </>
+      )}
+    </>
+  );
+}
+
+// Customer invoice / tailor card / grouped-order invoice on A4.
+function InvoicePrintModal({ data, onClose, order, group, kind }) {
+  const [tplId, setTplId] = useState(null);
+  const tpl = resolveTpl(data, "invoice", tplId);
+  const members = group ? data.orders.filter((o) => o.groupId === group.id) : [order];
+  const customer = data.customers.find((c) => c.id === (group ? group.customerId : order.customerId));
+  const branchName = (id) => data.branches.find((b) => b.id === id)?.name;
+  const isTailor = kind === "tailor";
+  const net = (o) => Math.max(0, (Number(o.price) || 0) - (Number(o.discount) || 0));
+  const totalPrice = members.reduce((t, o) => t + (Number(o.price) || 0), 0);
+  const totalDisc = members.reduce((t, o) => t + (Number(o.discount) || 0), 0);
+  const totalNet = members.reduce((t, o) => t + net(o), 0);
+  const totalPaid = members.reduce((t, o) => t + (Number(o.deposit) || 0), 0);
+  const first = members[0] || {};
+  const docNo = group ? group.groupNo : (first.orderNo || first.id?.slice(-6));
+  const title = group ? "فاتورة طلبية" : isTailor ? "بطاقة تفصيل" : "فاتورة";
+  const A = tpl.accent || "#A9752E";
+  const lineRows = members.map((o, i) => {
+    const emb = o.embroideryType && o.embroideryType !== "بدون" ? ` — تطريز ${o.embroideryType}` : "";
+    return isTailor
+      ? { key: o.id, n: i + 1, d: `طلب #${o.orderNo || o.id.slice(-6)} — ${o.orderType || ""}${emb}`, fabric: o.fabricType || "—", used: `${o.fabricUsed || 0} م`, due: o.deliveryDate || "—" }
+      : { key: o.id, n: i + 1, d: `طلب #${o.orderNo || o.id.slice(-6)} — ${o.orderType || ""}${emb}`, q: 1, p: fmtNum(o.price), disc: Number(o.discount) ? fmtNum(o.discount) : "—", net: fmtNum(net(o)) };
+  });
+  const columns = isTailor
+    ? [{ key: "n", label: "#", width: 30 }, { key: "d", label: "الطلب" }, { key: "fabric", label: "القماش" }, { key: "used", label: "الكمية المستخدمة" }, { key: "due", label: "موعد التسليم" }]
+    : [{ key: "n", label: "#", width: 30 }, { key: "d", label: "البيان" }, { key: "q", label: "الكمية", align: "center", width: 60 }, { key: "p", label: "السعر", align: "center", width: 80 }, { key: "disc", label: "الخصم", align: "center", width: 70 }, { key: "net", label: "الصافي", align: "center", width: 90, bold: true }];
+  const details = (o) => (
+    <div key={o.id} style={{ marginTop: 12, pageBreakInside: "avoid" }}>
+      <div style={{ fontWeight: 700, color: A, fontSize: 13, marginBottom: 4 }}>المقاسات والتصاميم — طلب #{o.orderNo || o.id.slice(-6)}</div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 4, fontSize: 12 }}>
+        {data.measurementFields.map((m) => <div key={m.key} style={{ border: "1px solid #e6e1d6", borderRadius: 3, padding: "3px 7px" }}>{m.label}: <b>{o.measurements?.[m.key] || "—"}</b></div>)}
+      </div>
+      <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 8 }}>
+        {data.designCategories.map((c) => { const item = c.items.find((i) => i.id === o.designs?.[c.id]); return item ? <div key={c.id} style={{ textAlign: "center" }}><DesignThumb item={item} size={32} /><div style={{ fontSize: 10 }}>{c.name}: {item.name}</div></div> : null; })}
+      </div>
+      {isTailor && o.embroideryType && o.embroideryType !== "بدون" && <div style={{ fontSize: 12, marginTop: 6 }}>التطريز: {o.embroideryType}{o.embroideryNotes ? ` — ${o.embroideryNotes}` : ""}</div>}
+      {o.notes && <div style={{ fontSize: 12, marginTop: 4 }}>ملاحظات: {o.notes}</div>}
+    </div>
+  );
+  return (
+    <Modal title={title} onClose={onClose} width={900}>
+      <PrintStage data={data} docType="invoice" tplId={tplId} setTplId={setTplId}>
+        <PrintSheet data={data} tpl={tpl} title={title} docNo={docNo} docNoLabel={group ? "طلبية رقم" : "رقم الطلب"} date={first.createdAt || ""}
+          barcode={String(docNo || "")} footerNote={isTailor ? "" : data.shopSettings?.invoiceFooter}
+          parties={[
+            { title: "بيانات العميل", rows: [{ label: "الاسم", value: customer?.name || "—" }, ...(customer?.phone ? [{ label: "الجوال", value: customer.phone }] : []), ...(customer?.code ? [{ label: "كود العميل", value: `#${customer.code}` }] : [])] },
+            { title: "بيانات الطلب", rows: [{ label: "الفرع", value: branchName(first.branch) || "—" }, { label: "موعد التسليم", value: first.deliveryDate || "—" }, ...(!isTailor ? [{ label: "طريقة الدفع", value: first.paymentMethod || "—" }] : [])] },
+          ]}
+          totals={isTailor ? undefined : [
+            { label: "الإجمالي", value: `${fmtNum(totalPrice)} ر.س` },
+            ...(totalDisc > 0 ? [{ label: "الخصم", value: `− ${fmtNum(totalDisc)} ر.س` }] : []),
+            { label: "الصافي المستحق", value: `${fmtNum(totalNet)} ر.س` },
+            { label: "المدفوع (عربون ودفعات)", value: `${fmtNum(totalPaid)} ر.س` },
+            { label: "المتبقي", value: `${fmtNum(totalNet - totalPaid)} ر.س`, strong: true },
+          ]}
+          notes={!isTailor && first.paymentMethod?.includes("تقسيط") ? "خيار التقسيط يتطلب ربط حساب تاجر فعلي مع المزوّد لإتمام العملية." : undefined}
+          signatures={isTailor ? ["القصّاص", "الخياط", "المراجع"] : ["توقيع العميل", "المستلم / أمين الصندوق"]}>
+          <PTable tpl={tpl} columns={columns} rows={lineRows} />
+          {members.map(details)}
+          {tpl.showQR && !isTailor && <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 8 }}><FakeQR seed={String(docNo)} /><div style={{ fontSize: 9, color: "#8A8071", maxWidth: 140 }}>رمز تجريبي — الفاتورة الإلكترونية المعتمدة تتطلب حلًا مرخّصًا من هيئة الزكاة والضريبة</div></div>}
+        </PrintSheet>
+      </PrintStage>
+    </Modal>
+  );
+}
+
+// ---------- Shared statement viewer (customers / suppliers / employees) ----------
+// Rows are { key, no, noLabel, date, desc, kind, inc, dec, branch | weights, ... }.
+// balance = opening + Σinc − Σdec. `weights` ({branchId: 0..1}) lets one row (e.g. a salary shared
+// between branches) be split when the statement is filtered to a single branch.
+function StatementView({ data, title, partyLines, rows, opening = 0, labels, onClose, renderAction }) {
+  const [mode, setMode] = useState("detail");
+  const [branch, setBranch] = useState("");
+  const [from, setFrom] = useState("");
+  const [to, setTo] = useState("");
+  const [tplId, setTplId] = useState(null);
+  const tpl = resolveTpl(data, "statement", tplId);
+  const T = tplTable(tpl);
+  const defaultBranch = data.branches[0]?.id;
+  const L = { inc: "مدين", dec: "دائن", ...labels };
+  const bName = (id) => data.branches.find((b) => b.id === id)?.name || "—";
+  const forBranch = (bid) => rows.map((r) => {
+    if (r.weights) { const w = Number(r.weights[bid]) || 0; return w > 0 ? { ...r, inc: r.inc * w, dec: r.dec * w, partial: w < 0.9999 ? w : null } : null; }
+    return (r.branch || defaultBranch) === bid ? r : null;
+  }).filter(Boolean);
+  const inRange = (r) => (!from || (r.date || "") >= from) && (!to || (r.date || "") <= to);
+  const sum = (arr, k) => round2(arr.reduce((t, r) => t + (Number(r[k]) || 0), 0));
+  const base = branch ? forBranch(branch) : rows;
+  const open = branch ? 0 : (Number(opening) || 0);
+  let run = open;
+  const withRun = base.map((r) => { run += r.inc - r.dec; return { ...r, running: round2(run) }; });
+  const carried = from ? (withRun.filter((r) => (r.date || "") < from).slice(-1)[0]?.running ?? open) : open;
+  const shown = withRun.filter(inRange);
+  const totalInc = sum(shown, "inc"), totalDec = sum(shown, "dec");
+  const closing = round2(carried + totalInc - totalDec);
+  const byKind = {}; shown.forEach((r) => { const k = r.kind || "أخرى"; byKind[k] = byKind[k] || { count: 0, inc: 0, dec: 0 }; byKind[k].count += 1; byKind[k].inc += r.inc; byKind[k].dec += r.dec; });
+  const showBranchTable = !branch && data.branches.length > 1;
+  const rowBranchLabel = (r) => r.weights ? (Object.keys(r.weights).filter((id) => r.weights[id] > 0).map(bName).join("، ")) : bName(r.branch || defaultBranch);
+  const periodText = (from || to) ? `${from || "…"} إلى ${to || "…"}` : "كل الفترات";
+  const num = (v) => (v ? fmtNum(v) : "—");
+  return (
+    <Modal title={title} onClose={onClose} width={900}>
+      <div className="no-print" style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr) auto", gap: 8, alignItems: "end", marginBottom: 4 }}>
+        <Field label="نوع الكشف"><SelectInput options={[{ value: "detail", label: "تفصيلي" }, { value: "summary", label: "إجمالي" }]} value={mode} onChange={(e) => setMode(e.target.value)} /></Field>
+        <Field label="الفرع"><SelectInput options={[{ value: "", label: "كل الفروع" }, ...data.branches.map((b) => ({ value: b.id, label: b.name }))]} value={branch} onChange={(e) => setBranch(e.target.value)} /></Field>
+        <Field label="من تاريخ"><TextInput type="date" value={from} onChange={(e) => setFrom(e.target.value)} /></Field>
+        <Field label="إلى تاريخ"><TextInput type="date" value={to} onChange={(e) => setTo(e.target.value)} /></Field>
+        {(from || to || branch) && <Btn small variant="ghost" onClick={() => { setFrom(""); setTo(""); setBranch(""); }} style={{ marginBottom: 12 }}>مسح</Btn>}
+      </div>
+      <PrintStage data={data} docType="statement" tplId={tplId} setTplId={setTplId}>
+        <PrintSheet data={data} tpl={tpl} title={mode === "detail" ? "كشف حساب تفصيلي" : "كشف حساب إجمالي"} date={new Date().toISOString().slice(0, 10)}
+          parties={[{ title: title.replace("كشف حساب ", ""), lines: (partyLines || []).filter(Boolean) }]}
+          meta={[{ label: "الفرع", value: branch ? bName(branch) : "كل الفروع" }, { label: "الفترة", value: periodText }, { label: from ? "الرصيد المُرحَّل" : "الرصيد الافتتاحي", value: `${fmtNum(carried)} ر.س` }]}
+          totals={[{ label: `إجمالي ${L.inc}`, value: `${fmtNum(totalInc)} ر.س` }, { label: `إجمالي ${L.dec}`, value: `${fmtNum(totalDec)} ر.س` }, { label: L.finalLabel || "الرصيد النهائي", value: `${fmtNum(closing)} ر.س`, strong: true }]}
+          notes={[L.balanceText ? L.balanceText(closing) : "", branch && Number(opening) !== 0 ? `الرصيد الافتتاحي (${fmtNum(opening)}) غير منسوب لفرع، لذلك يظهر فقط في كشف «كل الفروع».` : ""].filter(Boolean).join(" — ")}
+          signatures={["المحاسب", "المراجع / الطرف الآخر"]}>
+          {mode === "detail" ? (
+            <table style={T.table}>
+              <thead style={{ display: "table-header-group" }}><tr><th style={T.th}>الرقم</th><th style={T.th}>التاريخ</th>{!branch && <th style={T.th}>الفرع</th>}<th style={T.th}>البيان</th><th style={T.th}>{L.inc}</th><th style={T.th}>{L.dec}</th><th style={T.th}>الرصيد</th>{renderAction && <th className="no-print" style={T.th}></th>}</tr></thead>
+              <tbody>
+                {shown.length === 0 ? <tr><td colSpan={8} style={{ padding: 14, textAlign: "center", color: "#8A8071" }}>لا توجد حركات</td></tr> : shown.map((r, i) => (
+                  <tr key={r.key} style={{ pageBreakInside: "avoid" }}>
+                    <td style={{ ...T.td(i), fontWeight: 700, whiteSpace: "nowrap" }}>{r.noLabel ? `${r.noLabel} ` : ""}{r.no || "—"}</td>
+                    <td style={{ ...T.td(i), whiteSpace: "nowrap" }}>{r.date || "—"}</td>
+                    {!branch && <td style={{ ...T.td(i), fontSize: 11.5 }}>{rowBranchLabel(r)}</td>}
+                    <td style={T.td(i)}>{r.desc}{r.partial ? ` (حصة الفرع ${fmtNum(r.partial * 100)}%)` : ""}</td>
+                    <td style={T.td(i)}>{num(r.inc)}</td>
+                    <td style={T.td(i)}>{num(r.dec)}</td>
+                    <td style={{ ...T.td(i), fontWeight: 700 }}>{fmtNum(r.running)}</td>
+                    {renderAction && <td className="no-print" style={{ ...T.td(i), whiteSpace: "nowrap" }}>{renderAction(r)}</td>}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <>
+              <div style={{ fontWeight: 700, margin: "0 0 6px", fontSize: 13, color: tpl.accent }}>إجمالي حسب نوع الحركة</div>
+              <table style={T.table}>
+                <thead><tr><th style={T.th}>النوع</th><th style={T.th}>العدد</th><th style={T.th}>{L.inc}</th><th style={T.th}>{L.dec}</th></tr></thead>
+                <tbody>
+                  {Object.keys(byKind).length === 0 ? <tr><td colSpan={4} style={{ padding: 14, textAlign: "center", color: "#8A8071" }}>لا توجد حركات</td></tr> : Object.entries(byKind).map(([k, v], i) => (
+                    <tr key={k}><td style={{ ...T.td(i), fontWeight: 600 }}>{k}</td><td style={T.td(i)}>{v.count}</td><td style={T.td(i)}>{num(v.inc)}</td><td style={T.td(i)}>{num(v.dec)}</td></tr>
+                  ))}
+                  <tr style={{ fontWeight: 700 }}><td style={{ padding: "7px 8px", borderTop: `2px solid ${tpl.accent}` }}>الإجمالي</td><td style={{ padding: "7px 8px", borderTop: `2px solid ${tpl.accent}` }}>{shown.length}</td><td style={{ padding: "7px 8px", borderTop: `2px solid ${tpl.accent}` }}>{fmtNum(totalInc)}</td><td style={{ padding: "7px 8px", borderTop: `2px solid ${tpl.accent}` }}>{fmtNum(totalDec)}</td></tr>
+                </tbody>
+              </table>
+              {showBranchTable && (
+                <>
+                  <div style={{ fontWeight: 700, margin: "16px 0 6px", fontSize: 13, color: tpl.accent }}>إجمالي حسب الفرع</div>
+                  <table style={T.table}>
+                    <thead><tr><th style={T.th}>الفرع</th><th style={T.th}>{L.inc}</th><th style={T.th}>{L.dec}</th><th style={T.th}>الصافي</th></tr></thead>
+                    <tbody>
+                      {data.branches.map((b, i) => { const rs = forBranch(b.id).filter(inRange); const inc = sum(rs, "inc"), dec = sum(rs, "dec"); return (
+                        <tr key={b.id}><td style={{ ...T.td(i), fontWeight: 600 }}>{b.name}</td><td style={T.td(i)}>{num(inc)}</td><td style={T.td(i)}>{num(dec)}</td><td style={{ ...T.td(i), fontWeight: 700 }}>{fmtNum(inc - dec)}</td></tr>); })}
+                    </tbody>
+                  </table>
+                </>
+              )}
+            </>
+          )}
+        </PrintSheet>
+      </PrintStage>
+    </Modal>
+  );
+}
+
+// ---------- Print templates manager (inside "بيانات المحل") ----------
+function TemplateSample({ data, tpl, scale = 0.3 }) {
+  return (
+    <div style={{ width: 794 * scale, height: 1123 * scale, overflow: "hidden", border: `1px solid ${THEME.border}`, background: "#fff", position: "relative", flexShrink: 0 }}>
+      <div style={{ width: 794, transform: `scale(${scale})`, transformOrigin: "top right", position: "absolute", top: 0, right: 0 }}>
+        <PrintSheet preview data={data} tpl={tpl} title="سند قبض" docNo="1001" date="2026-10-03"
+          meta={[{ label: "الحساب", value: "الصندوق" }, { label: "الفرع", value: data.branches[0]?.name || "—" }, { label: "التصنيف", value: "دفعة على الحساب" }]}
+          amount={1250.5} parties={[{ title: "بيانات الدافع", rows: [{ label: "الاسم", value: "محمد أحمد" }, { label: "الجوال", value: "05XXXXXXXX" }] }]}
+          signatures={["توقيع الدافع", "توقيع المحاسب"]} showBank={false}>
+          <PTable tpl={tpl} columns={[{ key: "a", label: "البيان" }, { key: "b", label: "الكمية", align: "center" }, { key: "c", label: "المبلغ", align: "center" }]} rows={[{ a: "ثوب سعودي", b: 2, c: "800" }, { a: "ثوب قطري", b: 1, c: "450.5" }]} />
+        </PrintSheet>
+      </div>
+    </div>
+  );
+}
+
+function PrintTemplatesPanel({ data, update }) {
+  const [edit, setEdit] = useState(null);
+  const ps = data.printSettings || { defaults: {}, customTemplates: [] };
+  const setPs = (patch) => update({ printSettings: { ...ps, ...patch } });
+  const setDefault = (k, v) => setPs({ defaults: { ...(ps.defaults || {}), [k]: v } });
+  const startNew = (from) => setEdit({ ...(from || { accent: "#1F3A68", font: "cairo", header: "band", frame: "single", table: "striped", showLogo: true, showSignatures: true }), id: uid("tpl"), builtin: false, label: from ? `${from.label} (نسخة)` : "قالبي الخاص", isNew: true });
+  const saveTpl = () => {
+    const { isNew, ...t } = edit;
+    if (!String(t.label || "").trim()) { alert("أدخل اسم القالب"); return; }
+    const list = ps.customTemplates || [];
+    setPs({ customTemplates: isNew ? [...list, t] : list.map((x) => x.id === t.id ? t : x) });
+    setEdit(null);
+  };
+  const delTpl = (t) => {
+    if (!window.confirm(`حذف القالب «${t.label}»؟`)) return;
+    const defaults = { ...(ps.defaults || {}) }; Object.keys(defaults).forEach((k) => { if (defaults[k] === t.id) delete defaults[k]; });
+    setPs({ customTemplates: (ps.customTemplates || []).filter((x) => x.id !== t.id), defaults });
+  };
+  const pickImage = (key, maxDim) => (e) => {
+    const file = e.target.files[0]; if (!file) return;
+    const reader = new FileReader();
+    reader.onload = async () => { const img = await compressImageDataUrl(reader.result, maxDim, 0.85); setEdit((v) => ({ ...v, [key]: img })); };
+    reader.readAsDataURL(file);
+    e.target.value = "";
+  };
+  const opt = (arr) => arr.map(([value, label]) => ({ value, label }));
+  const all = allTemplates(data);
+  return (
+    <Panel style={{ marginTop: 20 }}>
+      <div style={{ fontWeight: 700, fontSize: 16, marginBottom: 4 }}>قوالب الطباعة (A4)</div>
+      <div style={{ fontSize: 12.5, color: "#7A7061", marginBottom: 14 }}>اختر القالب الافتراضي لكل نوع مستند، أو أنشئ قالبك الخاص بألوانك وترويستك. يمكن أيضًا تغيير القالب لحظة الطباعة من نافذة المعاينة.</div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(230px, 1fr))", gap: 10, marginBottom: 16 }}>
+        {DOC_TYPE_LABELS.map(([k, label]) => (
+          <Field key={k} label={label}><SelectInput options={all.map((t) => ({ value: t.id, label: t.label }))} value={ps.defaults?.[k] || "classic"} onChange={(e) => setDefault(k, e.target.value)} /></Field>
+        ))}
+      </div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+        <div style={{ fontWeight: 700 }}>القوالب المتاحة</div>
+        <Btn variant="brass" small onClick={() => startNew()}><Plus size={14} />قالب جديد</Btn>
+      </div>
+      <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
+        {all.map((t) => (
+          <div key={t.id} style={{ width: 794 * 0.3 + 4 }}>
+            <TemplateSample data={data} tpl={t} />
+            <div style={{ fontWeight: 700, fontSize: 13, margin: "6px 0 4px" }}>{t.label} {!t.builtin && <Badge color={THEME.teal}>خاص</Badge>}</div>
+            <div style={{ display: "flex", gap: 4, flexWrap: "wrap" }}>
+              {!t.builtin && <Btn small variant="ghost" onClick={() => setEdit({ ...t })}>تعديل</Btn>}
+              <Btn small variant="ghost" onClick={() => startNew(t)}>نسخ</Btn>
+              {!t.builtin && <Btn small variant="danger" onClick={() => delTpl(t)}>حذف</Btn>}
             </div>
           </div>
-          <div style={{ textAlign: "center" }}><BarcodeSVG value={refNo} height={34} width={1.4} /></div>
-        </div>
-        <div style={{ fontWeight: 700, margin: "10px 0 8px", color: THEME.brass }}>{refLabel} #{refNo}</div>
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 5, fontSize: 13.5 }}>
-          {rows.map((r, i) => <div key={i}>{r.label}: <b>{r.value}</b></div>)}
-        </div>
-        {attachment?.dataUrl && (
-          <div style={{ marginTop: 12, borderTop: `1px dashed ${THEME.border}`, paddingTop: 10 }}>
-            <div style={{ fontWeight: 700, marginBottom: 6, fontSize: 13 }}>المرفق</div>
-            {attachment.type?.startsWith("image/") ? <img src={attachment.dataUrl} alt="" style={{ maxWidth: "100%", borderRadius: 6, border: `1px solid ${THEME.border}` }} /> : <a href={attachment.dataUrl} download={attachment.name} style={{ color: THEME.teal, fontSize: 13 }}>تنزيل المرفق: {attachment.name}</a>}
-          </div>
-        )}
-        {data.shopSettings?.bankName && (
-          <div style={{ marginTop: 10, fontSize: 11, color: "#7A7061", borderTop: `1px dashed ${THEME.border}`, paddingTop: 8 }}>
-            تحويل بنكي: {data.shopSettings.bankName}{data.shopSettings.iban ? ` — آيبان: ${data.shopSettings.iban}` : ""}
-          </div>
-        )}
+        ))}
       </div>
-      <Btn variant="brass" small onClick={() => window.print && window.print()} style={{ marginTop: 12 }}><Printer size={14} />طباعة</Btn>
-    </Modal>
+
+      {edit && (
+        <Modal title={edit.isNew ? "قالب طباعة جديد" : "تعديل القالب"} onClose={() => setEdit(null)} width={1060}>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 20, alignItems: "start" }}>
+            <div>
+              <Field label="اسم القالب"><TextInput value={edit.label || ""} onChange={(e) => setEdit({ ...edit, label: e.target.value })} /></Field>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                <Field label="لون القالب"><input type="color" value={edit.accent || "#A9752E"} onChange={(e) => setEdit({ ...edit, accent: e.target.value })} style={{ width: "100%", height: 38, border: `1px solid ${THEME.border}`, borderRadius: 6, background: "#fff" }} /></Field>
+                <Field label="الخط"><SelectInput options={opt([["tajawal", "تجوال (عصري)"], ["amiri", "أميري (كلاسيكي)"], ["cairo", "القاهرة (رسمي)"]])} value={edit.font || "tajawal"} onChange={(e) => setEdit({ ...edit, font: e.target.value })} /></Field>
+                <Field label="شكل الترويسة"><SelectInput options={opt([["line", "خط سفلي"], ["band", "شريط ملوّن"], ["center", "مركزية مزخرفة"], ["split", "مقسومة بإطار للعنوان"]])} value={edit.header || "line"} onChange={(e) => setEdit({ ...edit, header: e.target.value })} /></Field>
+                <Field label="إطار الصفحة"><SelectInput options={opt([["none", "بدون"], ["single", "إطار مفرد"], ["double", "إطار مزدوج"]])} value={edit.frame || "none"} onChange={(e) => setEdit({ ...edit, frame: e.target.value })} /></Field>
+                <Field label="شكل الجداول"><SelectInput options={opt([["striped", "رأس ملوّن وصفوف متبادلة"], ["grid", "شبكة كاملة"], ["plain", "خطوط خفيفة"]])} value={edit.table || "striped"} onChange={(e) => setEdit({ ...edit, table: e.target.value })} /></Field>
+                <Field label="علامة مائية (اختياري)"><TextInput value={edit.watermark || ""} onChange={(e) => setEdit({ ...edit, watermark: e.target.value })} placeholder="مثال: نسخة أصلية" /></Field>
+              </div>
+              <Field label="نص تذييل ثابت (اختياري — يظهر أسفل كل مستند)"><TextInput value={edit.footerText || ""} onChange={(e) => setEdit({ ...edit, footerText: e.target.value })} /></Field>
+              <div style={{ display: "flex", gap: 18, flexWrap: "wrap", marginBottom: 12, fontSize: 13.5 }}>
+                <label style={{ display: "inline-flex", gap: 6, alignItems: "center" }}><input type="checkbox" checked={edit.showLogo !== false} onChange={(e) => setEdit({ ...edit, showLogo: e.target.checked })} />إظهار شعار المحل</label>
+                <label style={{ display: "inline-flex", gap: 6, alignItems: "center" }}><input type="checkbox" checked={edit.showSignatures !== false} onChange={(e) => setEdit({ ...edit, showSignatures: e.target.checked })} />خانات التوقيع</label>
+                <label style={{ display: "inline-flex", gap: 6, alignItems: "center" }}><input type="checkbox" checked={!!edit.showQR} onChange={(e) => setEdit({ ...edit, showQR: e.target.checked })} />رمز QR تجريبي بالفاتورة</label>
+              </div>
+              <div style={{ fontWeight: 700, marginBottom: 6, fontSize: 13.5 }}>تصميمك الخاص (اختياري)</div>
+              <div style={{ fontSize: 12, color: "#7A7061", marginBottom: 8 }}>ارفع صورة ترويسة جاهزة صممتها (مثلًا بعرض 2100 بكسل وارتفاع 400) فتحل محل الترويسة المبنية. وكذلك صورة للتذييل.</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                <div>
+                  <input type="file" accept="image/*" onChange={pickImage("headerImage", 1600)} style={{ fontSize: 12 }} />
+                  {edit.headerImage && <div style={{ marginTop: 6 }}><img src={edit.headerImage} alt="" style={{ width: "100%", border: `1px solid ${THEME.border}` }} /><Btn small variant="danger" onClick={() => setEdit({ ...edit, headerImage: "" })} style={{ marginTop: 4 }}>إزالة الترويسة</Btn></div>}
+                  <div style={{ fontSize: 11, color: "#8A8071", marginTop: 4 }}>صورة الترويسة</div>
+                </div>
+                <div>
+                  <input type="file" accept="image/*" onChange={pickImage("footerImage", 1600)} style={{ fontSize: 12 }} />
+                  {edit.footerImage && <div style={{ marginTop: 6 }}><img src={edit.footerImage} alt="" style={{ width: "100%", border: `1px solid ${THEME.border}` }} /><Btn small variant="danger" onClick={() => setEdit({ ...edit, footerImage: "" })} style={{ marginTop: 4 }}>إزالة التذييل</Btn></div>}
+                  <div style={{ fontSize: 11, color: "#8A8071", marginTop: 4 }}>صورة التذييل</div>
+                </div>
+              </div>
+              <div style={{ display: "flex", gap: 8, marginTop: 16 }}><Btn variant="brass" onClick={saveTpl}>حفظ القالب</Btn><Btn variant="ghost" onClick={() => setEdit(null)}>إلغاء</Btn></div>
+            </div>
+            <div><div style={{ fontSize: 12, color: "#7A7061", marginBottom: 4 }}>معاينة مباشرة</div><TemplateSample data={data} tpl={edit} scale={0.42} /></div>
+          </div>
+        </Modal>
+      )}
+    </Panel>
   );
 }
 
@@ -379,8 +934,20 @@ function Dashboard({ data }) {
 }
 
 // ---------- Customers ----------
+function customerStatementRows(data, c) {
+  const def = data.branches[0]?.id;
+  const orders = data.orders.filter((o) => o.customerId === c.id && !o.cancelled);
+  const ids = new Set(orders.map((o) => o.id));
+  const rows = [
+    ...orders.map((o) => ({ key: o.id, no: o.orderNo, noLabel: "طلب", date: o.createdAt, createdAt: "", desc: `${o.orderType || "طلب"}${Number(o.discount) > 0 ? ` (بعد خصم ${fmtNum(o.discount)})` : ""}`, kind: "طلبات", inc: Math.max(0, (Number(o.price) || 0) - (Number(o.discount) || 0)), dec: 0, branch: o.branch || def })),
+    ...data.vouchers.filter((v) => v.type === "قبض" && v.orderId && ids.has(v.orderId)).map((v) => ({ key: v.id, no: v.voucherNo, noLabel: "سند", isVoucher: true, voucher: v, date: v.date, createdAt: v.createdAt || "", desc: v.description || "دفعة", kind: v.category || "دفعة", inc: 0, dec: Number(v.amount) || 0, branch: v.branch || data.orders.find((o) => o.id === v.orderId)?.branch || def })),
+  ].sort((a, b) => (a.date || "").localeCompare(b.date || "") || (a.createdAt || "").localeCompare(b.createdAt || ""));
+  return rows;
+}
 function CustomersView({ data, update, canEdit, currentUser }) {
   const [modal, setModal] = useState(null);
+  const [statementFor, setStatementFor] = useState(null);
+  const [printingVoucher, setPrintingVoucher] = useState(null);
   const save = (values) => {
     const list = [...data.customers];
     if (modal.mode === "add") {
@@ -407,7 +974,7 @@ function CustomersView({ data, update, canEdit, currentUser }) {
   ];
   return (
     <>
-      <CrudSection icon={Users} title="إدارة العملاء" addLabel="عميل جديد" columns={["الكود", "الاسم", "الجوال", "عدد الطلبات", "نقاط الولاء", "التقييم"]} items={data.customers} searchKeys={["name", "phone", "code"]}
+      <CrudSection icon={Users} title="إدارة العملاء" addLabel="عميل جديد" columns={["الكود", "الاسم", "الجوال", "عدد الطلبات", "نقاط الولاء", "التقييم", "المتبقي عليه", ""]} items={data.customers} searchKeys={["name", "phone", "code"]}
         onAdd={canEdit ? () => setModal({ mode: "add", values: {} }) : undefined}
         onEdit={canEdit ? (it) => setModal({ mode: "edit", values: it }) : undefined}
         onDelete={canEdit ? (it) => update({ customers: data.customers.filter((c) => c.id !== it.id), freedCustomerCodes: [...(data.freedCustomerCodes || []), it.code].filter((v, i, arr) => v !== undefined && arr.indexOf(v) === i), auditLog: [...(data.auditLog || []), logEntry(currentUser, "حذف عميل", it.name)] }) : undefined}
@@ -417,8 +984,20 @@ function CustomersView({ data, update, canEdit, currentUser }) {
           const points = Math.floor(spend / 10);
           return (<><td style={{ padding: "10px 14px", fontWeight: 700, color: THEME.brass }}>#{it.code || "—"}</td><td style={{ padding: "10px 14px", fontWeight: 600 }}>{it.name}</td><td style={{ padding: "10px 14px" }}>{it.phone}</td><td style={{ padding: "10px 14px" }}>{custOrders.length}</td>
             <td style={{ padding: "10px 14px" }}>{points}</td>
-            <td style={{ padding: "10px 14px" }}><span style={{ display: "inline-flex", gap: 2 }}>{[1, 2, 3, 4, 5].map((n) => <Star key={n} size={14} fill={n <= (it.rating || 5) ? THEME.brass : "none"} color={THEME.brass} />)}</span></td></>);
+            <td style={{ padding: "10px 14px" }}><span style={{ display: "inline-flex", gap: 2 }}>{[1, 2, 3, 4, 5].map((n) => <Star key={n} size={14} fill={n <= (it.rating || 5) ? THEME.brass : "none"} color={THEME.brass} />)}</span></td>
+            {(() => { const rs = customerStatementRows(data, it); const bal = rs.reduce((t, r) => t + r.inc - r.dec, 0); return <td style={{ padding: "10px 14px", fontWeight: 700, color: bal > 0 ? THEME.red : THEME.teal }}>{fmtNum(bal)} ر.س</td>; })()}
+            <td style={{ padding: "10px 14px" }}><Btn small variant="ghost" onClick={() => setStatementFor(it)}>كشف حساب</Btn></td></>);
         }} />
+      {statementFor && (() => {
+        const c = data.customers.find((x) => x.id === statementFor.id) || statementFor;
+        return (
+          <StatementView data={data} title={`كشف حساب العميل — ${c.name}`} onClose={() => setStatementFor(null)}
+            partyLines={[c.code ? `كود #${c.code}` : "", c.phone]} rows={customerStatementRows(data, c)} opening={0}
+            labels={{ inc: "قيمة الطلبات", dec: "المدفوع", balanceText: (b) => `المتبقي على العميل: ${fmtNum(b)} ر.س` }}
+            renderAction={(r) => r.isVoucher ? <button onClick={() => setPrintingVoucher(r.voucher)} title="طباعة السند" style={{ background: "none", border: "none", cursor: "pointer" }}><Printer size={14} /></button> : null} />
+        );
+      })()}
+      {printingVoucher && <VoucherPrintModal data={data} voucher={printingVoucher} onClose={() => setPrintingVoucher(null)} />}
       {modal && (
         <Modal title={modal.mode === "add" ? "إضافة عميل" : "تعديل بيانات العميل"} onClose={() => setModal(null)} wide>
           <FormFields fields={fields} values={modal.values} setValues={(v) => setModal({ ...modal, values: v })} />
@@ -605,8 +1184,9 @@ function OrdersView({ data, update, canEdit, currentUser, currentUserRole }) {
     if (isNew && Number(order.deposit) > 0) {
       const accountId = PAYMENT_ACCOUNT_MAP[order.paymentMethod];
       if (accountId) {
-        const voucher = { id: uid("v"), type: "قبض", accountId, branch: order.branch, category: "عربون", amount: Number(order.deposit), description: `عربون طلب #${order.orderNo} — ${custName(order.customerId)}`, date: new Date().toISOString().slice(0, 10), orderId: order.id };
-        patch.vouchers = [...data.vouchers, voucher];
+        const bv = buildVoucher(patch.counters || data.counters, { type: "قبض", accountId, branch: order.branch, category: "عربون", amount: Number(order.deposit), description: `عربون طلب #${order.orderNo} — ${custName(order.customerId)}`, date: todayStr(), orderId: order.id, partyType: "عميل", partyId: order.customerId }, currentUser);
+        patch.vouchers = [...data.vouchers, bv.voucher];
+        patch.counters = bv.counters;
         patch.financeAccounts = data.financeAccounts.map((a) => a.id === accountId ? { ...a, balance: (Number(a.balance) || 0) + Number(order.deposit) } : a);
       }
     }
@@ -621,12 +1201,12 @@ function OrdersView({ data, update, canEdit, currentUser, currentUserRole }) {
     if (!amt || amt <= 0) { alert("أدخل مبلغًا صحيحًا"); return; }
     const accountId = PAYMENT_ACCOUNT_MAP[method];
     if (!accountId) { alert("طريقة الدفع هذه (تقسيط) تحتاج ربط مزوّد خارجي فعلي ولا يمكن تسجيلها في الصندوق مباشرة الآن"); return; }
-    const voucher = { id: uid("v"), type: "قبض", accountId, branch: order.branch, category: "دفعة على الحساب", amount: amt, description: `دفعة لطلب #${order.orderNo || order.id.slice(-6)} — ${custName(order.customerId)}`, date: new Date().toISOString().slice(0, 10), orderId: order.id };
-    const vouchers = [...data.vouchers, voucher];
+    const bv = buildVoucher(data.counters, { type: "قبض", accountId, branch: order.branch, category: "دفعة على الحساب", amount: amt, description: `دفعة لطلب #${order.orderNo || order.id.slice(-6)} — ${custName(order.customerId)}`, date: todayStr(), orderId: order.id, partyType: "عميل", partyId: order.customerId }, currentUser);
+    const vouchers = [...data.vouchers, bv.voucher];
     const financeAccounts = data.financeAccounts.map((a) => a.id === accountId ? { ...a, balance: (Number(a.balance) || 0) + amt } : a);
     const updatedOrder = { ...order, deposit: (Number(order.deposit) || 0) + amt };
     const orders = data.orders.map((o) => o.id === order.id ? updatedOrder : o);
-    update({ orders, vouchers, financeAccounts });
+    update({ orders, vouchers, financeAccounts, counters: bv.counters });
     setDetail(updatedOrder);
     setPayAmount("");
   };
@@ -650,7 +1230,7 @@ function OrdersView({ data, update, canEdit, currentUser, currentUserRole }) {
     const vouchers = data.vouchers.filter((v) => v.orderId !== order.id);
     const orders = data.orders.filter((o) => o.id !== order.id);
     const auditLog = [...(data.auditLog || []), logEntry(currentUser, "حذف نهائي لطلب (مدير النظام)", `طلب #${order.orderNo || order.id.slice(-6)} — ${custName(order.customerId)}`)];
-    update({ orders, vouchers, financeAccounts, auditLog });
+    update({ orders, vouchers, financeAccounts, auditLog, employeeLedger: (data.employeeLedger || []).filter((l) => l.orderId !== order.id) });
     setDetail(null);
   };
 
@@ -670,7 +1250,7 @@ function OrdersView({ data, update, canEdit, currentUser, currentUserRole }) {
           const vouchers = data.vouchers.filter((v) => v.orderId !== it.id);
           const orders = data.orders.map((o) => o.id === it.id ? { ...o, cancelled: true, cancelledAt: new Date().toLocaleString("ar-SA") } : o);
           const auditLog = [...(data.auditLog || []), logEntry(currentUser, "إلغاء طلب", `طلب #${it.orderNo || it.id.slice(-6)} — ${custName(it.customerId)}`)];
-          update({ orders, vouchers, financeAccounts, auditLog });
+          update({ orders, vouchers, financeAccounts, auditLog, employeeLedger: (data.employeeLedger || []).filter((l) => l.orderId !== it.id) });
         } : undefined}
         renderRow={(it) => (
           <>
@@ -883,7 +1463,7 @@ function CourierView({ data, update, canEdit }) {
   // exact stage and logs the receipt automatically, then moves on to the next stage.
   const moveOrder = (order) => {
     const stage = stageRef.current, op = opRef.current, courier = empName(courierRef.current);
-    let nextStage, assignmentPatch = {}, logNote;
+    let nextStage, assignmentPatch = {}, logNote, ledgerPatch = {};
     if (!stage) {
       nextStage = dataRef.current.orderStages[Math.min(stageIndex(order.stage) + 1, dataRef.current.orderStages.length - 1)];
     } else if (op === "تسليم") {
@@ -893,6 +1473,7 @@ function CourierView({ data, update, canEdit }) {
         assignmentPatch = { stageAssignments: { ...(order.stageAssignments || {}), [stage]: staff.id } };
         if (stage === "الخياطة") assignmentPatch.assignedTailorId = staff.id;
         logNote = `تسليم إلى ${stage} — ${staff.name}`;
+        ledgerPatch = buildEarningsPatch(dataRef.current, order, stage, staff);
       } else {
         logNote = `تسليم إلى ${stage}`;
       }
@@ -904,7 +1485,7 @@ function CourierView({ data, update, canEdit }) {
       logNote = `استلام من ${stage}${recordedEmp ? " — " + recordedEmp.name : ""}`;
     }
     const updated = { ...order, ...assignmentPatch, stage: nextStage, stageLog: [...(order.stageLog || []), { stage: nextStage, at: new Date().toLocaleString("ar-SA"), note: logNote, courier: courier || undefined }] };
-    updateRef.current({ orders: dataRef.current.orders.map((o) => o.id === updated.id ? updated : o) });
+    updateRef.current({ orders: dataRef.current.orders.map((o) => o.id === updated.id ? updated : o), ...ledgerPatch });
     return updated;
   };
 
@@ -1071,7 +1652,6 @@ function InvoicesView({ data, update }) {
     <div>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}><Receipt size={22} color={THEME.brass} /><h2 style={{ margin: 0, fontFamily: "Amiri, serif", fontSize: 26, color: THEME.ink }}>الفواتير</h2></div>
-        <Field label="ثيم الفاتورة"><SelectInput options={[{ value: "classic", label: "كلاسيكي" }, { value: "modern", label: "عصري (شريط علوي)" }, { value: "minimal", label: "مبسّط" }, { value: "elegant", label: "أنيق (إطار مزدوج)" }]} value={data.invoiceTheme} onChange={(e) => update({ invoiceTheme: e.target.value })} /></Field>
       </div>
 
       {data.orderGroups.length > 0 && (
@@ -1109,155 +1689,360 @@ function InvoicesView({ data, update }) {
           </table>
         )}
       </Panel>
-      {printingGroup && (() => {
-        const members = data.orders.filter((o) => o.groupId === printingGroup.id);
-        const totalPrice = members.reduce((s, o) => s + (Number(o.price) || 0), 0);
-        const totalDeposit = members.reduce((s, o) => s + (Number(o.deposit) || 0), 0);
-        return (
-          <RecordPrintModal data={data} title={`فاتورة الطلبية #${printingGroup.groupNo}`} refLabel="طلبية" refNo={printingGroup.groupNo} onClose={() => setPrintingGroup(null)}
-            rows={[
-              { label: "العميل", value: custName(printingGroup.customerId) },
-              ...members.map((o) => ({ label: `طلب #${o.orderNo} — ${o.orderType}`, value: `${o.price || 0} ر.س` })),
-              { label: "الإجمالي", value: `${totalPrice} ر.س` },
-              { label: "العربون المدفوع", value: `${totalDeposit} ر.س` },
-              { label: "المتبقي", value: `${totalPrice - totalDeposit} ر.س` },
-            ]} />
-        );
-      })()}
-      {printing && (() => {
-        const theme = data.invoiceTheme || "classic";
-        const accent = theme === "elegant" ? "#B8860B" : theme === "minimal" ? "#333333" : theme === "modern" ? THEME.teal : THEME.brass;
-        const headingFont = theme === "minimal" ? "Tajawal, sans-serif" : "Amiri, serif";
-        const outerStyle = theme === "elegant"
-          ? { border: `1px solid ${accent}`, borderRadius: 4, padding: 6 }
-          : theme === "minimal"
-          ? { border: "none", padding: 0 }
-          : theme === "modern"
-          ? { border: `1px solid ${THEME.border}`, borderRadius: 10, padding: 0, overflow: "hidden" }
-          : { border: `2px solid ${accent}`, borderRadius: 8, padding: 18 };
-        const Header = (
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", padding: theme === "modern" ? "16px 18px" : theme === "elegant" ? "14px 16px" : 0, background: theme === "modern" ? accent : "transparent", color: theme === "modern" ? "#fff" : "inherit" }}>
-            <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
-              {data.shopSettings?.logo && <img src={data.shopSettings.logo} alt="" style={{ width: 40, height: 40, objectFit: "cover", borderRadius: 6, border: theme === "modern" ? "1px solid rgba(255,255,255,0.5)" : `1px solid ${THEME.border}` }} />}
-              <div>
-                <div style={{ fontFamily: headingFont, fontSize: 20 }}>{data.shopSettings?.name || "مشغل الخياطة الرجالية"}</div>
-                {data.shopSettings?.phone && <div style={{ fontSize: 11.5, opacity: 0.85 }}>{data.shopSettings.phone}{data.shopSettings.city ? ` — ${data.shopSettings.city}` : ""}</div>}
-                {(data.shopSettings?.crNumber || data.shopSettings?.taxNumber) && <div style={{ fontSize: 11, opacity: 0.75 }}>{data.shopSettings.crNumber && `س.ت: ${data.shopSettings.crNumber}`}{data.shopSettings.crNumber && data.shopSettings.taxNumber && " — "}{data.shopSettings.taxNumber && `ض.ق.م: ${data.shopSettings.taxNumber}`}</div>}
-              </div>
-            </div>
-            {printing.kind === "customer" && theme !== "minimal" && <div style={{ textAlign: "center" }}><FakeQR seed={printing.order.id} /><div style={{ fontSize: 9, opacity: 0.7, marginTop: 4, maxWidth: 90 }}>رمز تجريبي — يتطلب حل معتمد من هيئة الزكاة والضريبة</div></div>}
-          </div>
-        );
-        const Body = (
-          <div style={{ padding: theme === "modern" ? "16px 18px" : theme === "elegant" ? "10px 16px 16px" : 0 }}>
-            {theme === "elegant" && <div style={{ height: 1, background: accent, margin: "0 0 12px", opacity: 0.5 }} />}
-            <div style={{ fontSize: 15, fontWeight: 700, margin: theme === "modern" ? "0 0 8px" : "10px 0 6px", color: accent, textAlign: theme === "elegant" ? "center" : "right" }}>رقم الطلب: #{printing.order.orderNo || printing.order.id.slice(-6)}</div>
-            <div style={{ fontSize: 13.5 }}>العميل: {custName(printing.order.customerId)}</div>
-            <div style={{ fontSize: 13.5 }}>نوع الخياطة: {printing.order.orderType}</div>
-            <div style={{ fontSize: 13.5, marginBottom: 8 }}>موعد التسليم: {printing.order.deliveryDate || "—"}</div>
-
-            <div style={{ textAlign: "center", margin: "10px 0" }}><BarcodeSVG value={printing.order.orderNo} /></div>
-
-            {printing.kind === "tailor" && (
-              <div style={{ marginTop: 10, fontSize: 13.5 }}>
-                القماش: {printing.order.fabricType || "—"} — {printing.order.fabricUsed || 0} متر
-                {printing.order.embroideryType && printing.order.embroideryType !== "بدون" && (
-                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
-                    <DesignThumb item={data.embroideryTypes?.find((t) => t.name === printing.order.embroideryType)} size={28} />
-                    <span>التطريز: {printing.order.embroideryType}{printing.order.embroideryNotes ? ` — ${printing.order.embroideryNotes}` : ""}</span>
-                  </div>
-                )}
-              </div>
-            )}
-
-            <div style={{ fontWeight: 700, margin: "10px 0 6px", color: theme === "minimal" ? "#555" : "inherit", letterSpacing: theme === "minimal" ? 0.5 : 0 }}>المقاسات</div>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4, fontSize: 13 }}>
-              {data.measurementFields.map((m) => <div key={m.key}>{m.label}: {printing.order.measurements[m.key] || "—"}</div>)}
-            </div>
-            <div style={{ fontWeight: 700, margin: "10px 0 6px", color: theme === "minimal" ? "#555" : "inherit" }}>التصاميم</div>
-            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-              {data.designCategories.map((c) => { const item = c.items.find((i) => i.id === printing.order.designs[c.id]); return item ? <div key={c.id} style={{ textAlign: "center" }}><DesignThumb item={item} size={32} /><div style={{ fontSize: 10 }}>{item.name}</div></div> : null; })}
-            </div>
-            {printing.kind === "customer" && (
-              <div style={{ marginTop: 12, borderTop: `1px dashed ${THEME.border}`, paddingTop: 10, fontSize: 14 }}>
-                <div>السعر الإجمالي: {printing.order.price || 0} ر.س</div>
-                <div>العربون المدفوع: {printing.order.deposit || 0} ر.س</div>
-                <div style={{ fontWeight: 700, color: accent }}>المتبقي: {(Number(printing.order.price) || 0) - (Number(printing.order.deposit) || 0)} ر.س</div>
-                <div>طريقة الدفع: {printing.order.paymentMethod}</div>
-                {printing.order.paymentMethod?.includes("تقسيط") && <div style={{ fontSize: 11.5, color: "#8A8071", marginTop: 4 }}>هذا الخيار يتطلب ربط حساب تاجر فعلي مع المزوّد لإتمام العملية.</div>}
-                {data.shopSettings?.bankName && <div style={{ fontSize: 11, color: "#7A7061", marginTop: 6 }}>تحويل بنكي: {data.shopSettings.bankName}{data.shopSettings.iban ? ` — ${data.shopSettings.iban}` : ""}</div>}
-                {data.shopSettings?.invoiceFooter && <div style={{ marginTop: 10, fontSize: 12, color: "#7A7061", borderTop: `1px dashed ${THEME.border}`, paddingTop: 8 }}>{data.shopSettings.invoiceFooter}</div>}
-              </div>
-            )}
-          </div>
-        );
-        return (
-          <Modal title={printing.kind === "customer" ? "فاتورة العميل" : "بطاقة الخياط (بدون أسعار)"} onClose={() => setPrinting(null)}>
-            <div style={outerStyle}>
-              {theme === "elegant" ? <div style={{ border: `1px solid ${accent}`, borderRadius: 3 }}>{Header}{Body}</div> : <>{Header}{Body}</>}
-            </div>
-            <Btn variant="brass" small onClick={() => window.print && window.print()} style={{ marginTop: 12 }}><Printer size={14} />طباعة</Btn>
-          </Modal>
-        );
-      })()}
+      {printingGroup && <InvoicePrintModal data={data} group={printingGroup} kind="customer" onClose={() => setPrintingGroup(null)} />}
+      {printing && <InvoicePrintModal data={data} order={printing.order} kind={printing.kind} onClose={() => setPrinting(null)} />}
     </div>
   );
 }
 
 // ---------- Employees ----------
+// ---------- Employee ledger helpers ----------
+// Every employee has an account: money owed to them (salary, per-piece wages, percentages, bonuses)
+// is a "credit" entry in data.employeeLedger; money paid out (payment / advance vouchers) or deducted is a "debit".
+function employeeStatement(data, e) {
+  const def = data.branches[0]?.id;
+  const ebr = empBranches(data, e);
+  const weights = {}; ebr.forEach((id) => { weights[id] = empBranchWeight(data, e, id); });
+  const rows = [
+    ...(data.employeeLedger || []).filter((l) => l.employeeId === e.id).map((l) => {
+      const ord = l.orderId ? data.orders.find((o) => o.id === l.orderId) : null;
+      const where = l.branchId ? { branch: l.branchId } : ord ? { branch: ord.branch || def } : ebr.length > 1 ? { weights } : { branch: ebr[0] || def };
+      return { key: l.id, no: l.entryNo, noLabel: "قيد", date: l.date, createdAt: l.createdAt || "", desc: l.desc, kind: l.kind, inc: Number(l.credit) || 0, dec: Number(l.debit) || 0, ...where };
+    }),
+    ...data.vouchers.filter((v) => v.employeeId === e.id).map((v) => {
+      const amt = Number(v.amount) || 0, out = v.type === "صرف";
+      return { key: v.id, no: v.voucherNo, noLabel: "سند", isVoucher: true, voucher: v, date: v.date, createdAt: v.createdAt || "", desc: (out ? (v.category || "دفعة") : "مبلغ مقبوض من الموظف") + (v.description ? ` — ${v.description}` : ""), kind: out ? (v.category === "سلفة موظف" ? "سلفة" : "دفعة") : "قبض", inc: out ? 0 : amt, dec: out ? amt : 0, branch: v.branch || ebr[0] || def };
+    }),
+  ].sort((a, b) => (a.date || "").localeCompare(b.date || "") || (a.createdAt || "").localeCompare(b.createdAt || ""));
+  let running = Number(e.openingBalance) || 0;
+  const withRunning = rows.map((r) => { running += r.inc - r.dec; return { ...r, running: round2(running) }; });
+  return { rows: withRunning, balance: round2(running) };
+}
+const employeeBalance = (data, e) => employeeStatement(data, e).balance;
+function payTypeText(e) {
+  const p = [];
+  if (Number(e.baseSalary) > 0) p.push(`راتب ${fmtNum(e.baseSalary)}`);
+  if (Number(e.commissionPercent) > 0) p.push(`نسبة ${e.commissionPercent}%`);
+  if (Number(e.commissionPerPiece) > 0) p.push(`${fmtNum(e.commissionPerPiece)} / قطعة`);
+  if (Number(e.profitSharePercent) > 0) p.push(`${e.profitSharePercent}% من الأرباح`);
+  return p.length ? p.join(" + ") : "غير محدد";
+}
+// When a courier hands a piece to an employee, credit that employee right away:
+// the per-piece wage and/or the agreed percentage of the order value (price minus discount).
+// Re-scanning the same order/stage for the same employee never double-credits.
+function buildEarningsPatch(data, order, stage, staff) {
+  const ledger = data.employeeLedger || [];
+  const same = ledger.filter((l) => l.auto && l.orderId === order.id && l.stage === stage);
+  if (same.some((l) => l.employeeId === staff.id)) return {};
+  const kept = ledger.filter((l) => !same.includes(l));
+  let counters = data.counters || {};
+  const added = [];
+  const net = Math.max(0, (Number(order.price) || 0) - (Number(order.discount) || 0));
+  const label = `طلب #${order.orderNo || order.id.slice(-6)} — ${stage}`;
+  const mk = (kind, amount, desc) => {
+    const n = nextCounter(counters, "empEntry", 5000); counters = n.counters;
+    added.push({ id: uid("el"), entryNo: n.no, employeeId: staff.id, date: todayStr(), createdAt: new Date().toISOString(), kind, desc, credit: round2(amount), debit: 0, orderId: order.id, stage, auto: true });
+  };
+  if (Number(staff.commissionPerPiece) > 0) mk("قطعة", Number(staff.commissionPerPiece), `أجر قطعة — ${label}`);
+  if (Number(staff.commissionPercent) > 0 && net > 0) mk("نسبة", net * Number(staff.commissionPercent) / 100, `نسبة ${staff.commissionPercent}% من ${fmtNum(net)} ر.س — ${label}`);
+  if (!added.length && kept.length === ledger.length) return {};
+  return { employeeLedger: [...kept, ...added], counters };
+}
+
 function EmployeesView({ data, update, canEdit, currentUser }) {
   const [modal, setModal] = useState(null);
+  const [payModal, setPayModal] = useState(null);
+  const [adjModal, setAdjModal] = useState(null);
+  const [salaryModal, setSalaryModal] = useState(null);
+  const [profitModal, setProfitModal] = useState(null);
+  const [statementFor, setStatementFor] = useState(null);
+  const [printingVoucher, setPrintingVoucher] = useState(null);
   const roles = ["خياط", "مدير فرع", "قصّاص", "مراسل", "كاوي", "زرّار", "كاشير"];
   const fields = [
-    { key: "name", label: "الاسم" }, { key: "phone", label: "الجوال" },
+    { key: "name", label: "الاسم" }, { key: "phone", label: "الجوال" }, { key: "idNumber", label: "رقم الهوية / الإقامة (يظهر في السند)" },
     { key: "role", label: "الدور الوظيفي", type: "select", options: roles.map((r) => ({ value: r, label: r })) },
-    { key: "branch", label: "الفرع", type: "select", options: data.branches.map((b) => ({ value: b.id, label: b.name })) },
-    { key: "baseSalary", label: "الراتب الأساسي (ر.س) — اختياري", type: "number" },
-    { key: "commissionPercent", label: "نسبة من مبيعات الفرع % — اختياري", type: "number" },
-    { key: "commissionPerPiece", label: "أجر لكل قطعة مسندة إليه (ر.س) — اختياري", type: "number" },
+    { key: "baseSalary", label: "الراتب الشهري (ر.س) — اختياري", type: "number" },
+    { key: "commissionPercent", label: "نسبة % من قيمة كل طلب (تُحتسب فور تسليمه القطعة) — اختياري", type: "number" },
+    { key: "commissionPerPiece", label: "مبلغ ثابت لكل طلب/قطعة بالريال (مثال 5 ر.س) — اختياري", type: "number" },
+    { key: "profitSharePercent", label: "نسبة % من أرباح المحل (تُثبَّت آخر الشهر) — اختياري", type: "number" },
+    { key: "openingBalance", label: "رصيد افتتاحي (ر.س) — مستحقات له قبل النظام (سالب = عليه)", type: "number" },
   ];
-  const save = (values) => { const list = [...data.employees]; if (modal.mode === "add") list.push({ id: uid("emp"), ...values }); else { const i = list.findIndex((e) => e.id === values.id); list[i] = values; } update({ employees: list }); setModal(null); };
+  const save = (values) => {
+    if (!String(values.name || "").trim()) { alert("أدخل اسم الموظف"); return; }
+    const brs = empBranches(data, values);
+    if (!brs.length) { alert("اختر فرعًا واحدًا على الأقل"); return; }
+    let shares = {};
+    if (brs.length > 1) {
+      const total = brs.reduce((t, id) => t + (Number(values.branchShares?.[id]) || 0), 0);
+      if (Math.abs(total - 100) > 0.01) { alert(`مجموع نسب الفروع يجب أن يساوي 100% (الحالي ${fmtNum(total)}%)`); return; }
+      brs.forEach((id) => { shares[id] = Number(values.branchShares[id]) || 0; });
+    }
+    const clean = { ...values, branches: brs, branch: brs[0], branchShares: shares };
+    const list = [...data.employees];
+    if (modal.mode === "add") list.push({ id: uid("emp"), ...clean }); else { const i = list.findIndex((e) => e.id === clean.id); list[i] = clean; }
+    update({ employees: list }); setModal(null);
+  };
 
-  // Automatic payroll estimate for every employee: base salary + a percentage of their
-  // branch's total sales + a per-piece amount for pieces assigned to them and delivered.
-  const payroll = data.employees.filter((e) => Number(e.baseSalary) || Number(e.commissionPercent) || Number(e.commissionPerPiece)).map((e) => {
-    const branchRevenue = data.orders.filter((o) => o.branch === e.branch).reduce((s, o) => s + (Number(o.price) || 0), 0);
-    const roleStage = ROLE_STAGE_MAP[e.role];
-    const pieces = data.orders.filter((o) => o.stage === "تم التسليم" && ((roleStage && o.stageAssignments?.[roleStage] === e.id) || (e.role === "خياط" && o.assignedTailorId === e.id))).length;
-    const fromSalary = Number(e.baseSalary) || 0;
-    const fromPercent = e.commissionPercent ? branchRevenue * (Number(e.commissionPercent) / 100) : 0;
-    const fromPieces = e.commissionPerPiece ? pieces * Number(e.commissionPerPiece) : 0;
-    return { ...e, pieces, fromSalary, fromPercent, fromPieces, due: fromSalary + fromPercent + fromPieces };
-  });
+  const savePayment = () => {
+    const { employee, values } = payModal;
+    const amt = Number(values.amount);
+    if (!amt || amt <= 0) { alert("أدخل مبلغًا صحيحًا"); return; }
+    const isAdvance = values.kind === "سلفة موظف";
+    const bv = buildVoucher(data.counters, { type: "صرف", accountId: values.accountId, branch: values.branch || empBranches(data, employee)[0], category: isAdvance ? "سلفة موظف" : "رواتب", amount: amt, description: values.note || (isAdvance ? `سلفة للموظف ${employee.name}` : `صرف مستحقات الموظف ${employee.name}`), date: values.date || todayStr(), partyType: "موظف", partyId: employee.id, employeeId: employee.id, partyName: employee.name, partyPhone: employee.phone || "" }, currentUser);
+    const financeAccounts = data.financeAccounts.map((a) => a.id === values.accountId ? { ...a, balance: (Number(a.balance) || 0) - amt } : a);
+    update({ vouchers: [...data.vouchers, bv.voucher], financeAccounts, counters: bv.counters });
+    setPayModal(null);
+    setPrintingVoucher(bv.voucher);
+  };
+
+  const saveAdjustment = () => {
+    const { employee, values } = adjModal;
+    const amt = Number(values.amount);
+    if (!amt || amt <= 0) { alert("أدخل مبلغًا صحيحًا"); return; }
+    const n = nextCounter(data.counters, "empEntry", 5000);
+    const isBonus = values.kind === "مكافأة";
+    const entry = { id: uid("el"), entryNo: n.no, employeeId: employee.id, date: values.date || todayStr(), createdAt: new Date().toISOString(), kind: values.kind, desc: values.note || values.kind, credit: isBonus ? amt : 0, debit: isBonus ? 0 : amt, by: currentUser };
+    update({ employeeLedger: [...(data.employeeLedger || []), entry], counters: n.counters });
+    setAdjModal(null);
+  };
+
+  // Month-end salary: credits every selected employee's account with base / monthDays × days worked.
+  const openSalary = () => {
+    const month = todayStr().slice(0, 7);
+    const rows = {}; data.employees.filter((e) => Number(e.baseSalary) > 0).forEach((e) => { rows[e.id] = { include: true, days: 30 }; });
+    setSalaryModal({ month, monthDays: 30, rows });
+  };
+  const salaryDone = (empId, month) => (data.employeeLedger || []).some((l) => l.employeeId === empId && l.kind === "راتب" && l.month === month);
+  const saveSalaries = () => {
+    const { month, monthDays, rows } = salaryModal;
+    let counters = data.counters; const added = [];
+    data.employees.filter((e) => rows[e.id]?.include && !salaryDone(e.id, month)).forEach((e) => {
+      const days = Number(rows[e.id].days) || 0; const md = Number(monthDays) || 30;
+      if (days <= 0) return;
+      const amount = round2(Number(e.baseSalary) / md * days);
+      const n = nextCounter(counters, "empEntry", 5000); counters = n.counters;
+      added.push({ id: uid("el"), entryNo: n.no, employeeId: e.id, date: todayStr(), createdAt: new Date().toISOString(), kind: "راتب", month, days, desc: `راتب شهر ${month} — ${days} يوم من ${md}`, credit: amount, debit: 0, by: currentUser });
+    });
+    if (!added.length) { alert("لا يوجد رواتب جديدة لإثباتها"); return; }
+    update({ employeeLedger: [...(data.employeeLedger || []), ...added], counters });
+    setSalaryModal(null);
+  };
+
+  // Monthly net profit PER BRANCH, shown with its full breakdown before anything is posted.
+  // Purchases / vouchers / orders belong to their own branch; purchases saved before branches
+  // existed count toward the first branch. Wages count toward the branch of the employee who earned them.
+  const defaultBranch = data.branches[0]?.id;
+  const computeProfit = (month, branchId) => {
+    const inMonth = (d) => String(d || "").slice(0, 7) === month;
+    const sumBy = (arr, f) => round2(arr.reduce((t, x) => t + (Number(f(x)) || 0), 0));
+    const revenue = sumBy(data.orders.filter((o) => !o.cancelled && o.branch === branchId && inMonth(o.createdAt)), (o) => Math.max(0, (Number(o.price) || 0) - (Number(o.discount) || 0)));
+    const purchases = sumBy(data.purchases.filter((x) => (x.branch || defaultBranch) === branchId && inMonth(x.date)), (x) => x.cost);
+    const expenses = sumBy(data.vouchers.filter((v) => v.type === "صرف" && (v.branch || defaultBranch) === branchId && inMonth(v.date) && !v.employeeId && !v.supplierId), (v) => v.amount);
+    const wages = round2((data.employeeLedger || []).filter((l) => ["راتب", "قطعة", "نسبة", "مكافأة"].includes(l.kind) && (l.month ? l.month === month : inMonth(l.date))).reduce((t, l) => {
+      const emp = data.employees.find((e) => e.id === l.employeeId);
+      const ord = l.orderId ? data.orders.find((o) => o.id === l.orderId) : null;
+      const w = ord ? ((ord.branch || defaultBranch) === branchId ? 1 : 0) : (emp ? empBranchWeight(data, emp, branchId) : (defaultBranch === branchId ? 1 : 0));
+      return t + (Number(l.credit) || 0) * w;
+    }, 0));
+    return { revenue, purchases, expenses, wages, profit: round2(revenue - purchases - expenses - wages) };
+  };
+  const profitBranches = () => data.branches.filter((br) => data.employees.some((e) => empBranches(data, e).includes(br.id) && Number(e.profitSharePercent) > 0));
+  const profitDone = (empId, month, branchId) => (data.employeeLedger || []).some((l) => l.employeeId === empId && l.kind === "أرباح" && l.month === month && (!l.branchId || l.branchId === branchId));
+  const calcProfits = (month) => { const o = {}; profitBranches().forEach((br) => { o[br.id] = computeProfit(month, br.id).profit; }); return o; };
+  const openProfit = () => { const month = todayStr().slice(0, 7); setProfitModal({ month, profits: calcProfits(month), include: {} }); };
+  const saveProfit = () => {
+    const { month, profits, include } = profitModal;
+    let counters = data.counters; const added = [];
+    data.employees.filter((e) => Number(e.profitSharePercent) > 0).forEach((e) => empBranches(data, e).forEach((br) => {
+      if (include[`${e.id}:${br}`] === false || profitDone(e.id, month, br)) return;
+      const base = Number(profits[br]) || 0;
+      if (base <= 0) return;
+      const n = nextCounter(counters, "empEntry", 5000); counters = n.counters;
+      const brName = data.branches.find((x) => x.id === br)?.name || "";
+      added.push({ id: uid("el"), entryNo: n.no, employeeId: e.id, date: todayStr(), createdAt: new Date().toISOString(), kind: "أرباح", month, branchId: br, desc: `نسبة ${e.profitSharePercent}% من أرباح ${brName} لشهر ${month} (${fmtNum(base)} ر.س)`, credit: round2(base * Number(e.profitSharePercent) / 100), debit: 0, by: currentUser });
+    }));
+    if (!added.length) { alert("لا توجد نسب أرباح جديدة لإثباتها (تأكد أن ربح الفرع موجب)"); return; }
+    update({ employeeLedger: [...(data.employeeLedger || []), ...added], counters });
+    setProfitModal(null);
+  };
+
+  const removeEntry = (entry) => {
+    if (!window.confirm(`حذف القيد رقم ${entry.no}؟ سيتغيّر رصيد الموظف.`)) return;
+    update({ employeeLedger: (data.employeeLedger || []).filter((l) => l.id !== entry.key), auditLog: [...(data.auditLog || []), logEntry(currentUser, "حذف قيد موظف", `قيد #${entry.no} — ${entry.desc}`)] });
+  };
+
+  const totalDue = data.employees.reduce((s, e) => s + Math.max(0, employeeBalance(data, e)), 0);
 
   return (
     <>
-      {payroll.length > 0 && (
-        <Panel style={{ marginBottom: 20 }}>
-          <div style={{ fontWeight: 700, marginBottom: 10 }}>تقدير مستحقات الموظفين (تُحسب تلقائيًا)</div>
-          {payroll.map((p) => (
-            <div key={p.id} style={{ padding: "8px 0", borderBottom: `1px dashed ${THEME.border}`, fontSize: 13.5 }}>
-              <div style={{ display: "flex", justifyContent: "space-between" }}><span style={{ fontWeight: 700 }}>{p.name}</span><b>{p.due.toLocaleString()} ر.س</b></div>
-              <div style={{ fontSize: 11.5, color: "#7A7061" }}>
-                {p.fromSalary > 0 && <>راتب أساسي: {p.fromSalary.toLocaleString()} ر.س{(p.fromPercent > 0 || p.fromPieces > 0) ? " — " : ""}</>}
-                {p.fromPercent > 0 && <>{p.commissionPercent}% من مبيعات الفرع: {p.fromPercent.toLocaleString()} ر.س{p.fromPieces > 0 ? " — " : ""}</>}
-                {p.fromPieces > 0 && <>{p.pieces} قطعة × {p.commissionPerPiece} ر.س: {p.fromPieces.toLocaleString()} ر.س</>}
-              </div>
-            </div>
-          ))}
-        </Panel>
-      )}
-      <CrudSection icon={Briefcase} title="إدارة الموظفين" addLabel="موظف جديد" columns={["الاسم", "الدور", "الفرع", "الجوال"]} items={data.employees} searchKeys={["name", "role"]}
-        onAdd={canEdit ? () => setModal({ mode: "add", values: { role: roles[0], branch: data.branches[0]?.id } }) : undefined}
+      <CrudSection icon={Briefcase} title="إدارة الموظفين وكشوف حساباتهم" addLabel="موظف جديد" columns={["الاسم", "الدور", "نظام الأجر", "الرصيد المستحق", ""]} items={data.employees} searchKeys={["name", "role"]}
+        extraHeader={canEdit ? <><Btn variant="ghost" onClick={openSalary}>إثبات رواتب الشهر</Btn><Btn variant="ghost" onClick={openProfit}>إثبات نسبة الأرباح</Btn></> : null}
+        onAdd={canEdit ? () => setModal({ mode: "add", values: { role: roles[0], branch: data.branches[0]?.id, branches: data.branches[0] ? [data.branches[0].id] : [], openingBalance: 0 } }) : undefined}
         onEdit={canEdit ? (it) => setModal({ mode: "edit", values: it }) : undefined}
-        onDelete={canEdit ? (it) => update({ employees: data.employees.filter((e) => e.id !== it.id), auditLog: [...(data.auditLog || []), logEntry(currentUser, "حذف موظف", `${it.name} (${it.role})`)] }) : undefined}
-        renderRow={(it) => (<><td style={{ padding: "10px 14px", fontWeight: 600 }}>{it.name}</td><td style={{ padding: "10px 14px" }}><Badge color={THEME.teal}>{it.role}</Badge></td><td style={{ padding: "10px 14px" }}>{data.branches.find((b) => b.id === it.branch)?.name || "—"}</td><td style={{ padding: "10px 14px" }}>{it.phone}</td></>)} />
+        onDelete={canEdit ? (it) => {
+          const has = (data.employeeLedger || []).some((l) => l.employeeId === it.id) || data.vouchers.some((v) => v.employeeId === it.id);
+          if (has && !window.confirm(`لهذا الموظف حركات مالية مسجّلة في كشف حسابه. الحذف يُخفي كشفه. متابعة؟`)) return;
+          update({ employees: data.employees.filter((e) => e.id !== it.id), auditLog: [...(data.auditLog || []), logEntry(currentUser, "حذف موظف", `${it.name} (${it.role})`)] });
+        } : undefined}
+        renderRow={(it) => {
+          const bal = employeeBalance(data, it);
+          return (
+            <>
+              <td style={{ padding: "10px 14px", fontWeight: 600 }}>{it.name}<div style={{ fontSize: 11.5, color: "#8A8071", fontWeight: 400 }}>{it.phone}</div></td>
+              <td style={{ padding: "10px 14px" }}><Badge color={THEME.teal}>{it.role}</Badge><div style={{ fontSize: 11.5, color: "#8A8071", marginTop: 3 }}>{empBranches(data, it).map((id) => data.branches.find((b) => b.id === id)?.name).filter(Boolean).join("، ")}</div></td>
+              <td style={{ padding: "10px 14px", fontSize: 13 }}>{payTypeText(it)}</td>
+              <td style={{ padding: "10px 14px", fontWeight: 700, color: bal > 0 ? THEME.red : THEME.teal }}>{fmtNum(bal)} ر.س{bal < 0 && <div style={{ fontSize: 11, fontWeight: 400 }}>(عليه)</div>}</td>
+              <td style={{ padding: "10px 14px", whiteSpace: "nowrap" }}>
+                <div style={{ display: "flex", gap: 6, justifyContent: "flex-end" }}>
+                  {canEdit && <Btn small variant="ghost" onClick={() => setPayModal({ employee: it, values: { kind: "رواتب", accountId: data.financeAccounts[0]?.id, amount: bal > 0 ? bal : "", date: todayStr(), note: "" } })}>صرف / سلفة</Btn>}
+                  {canEdit && <Btn small variant="ghost" onClick={() => setAdjModal({ employee: it, values: { kind: "مكافأة", amount: "", date: todayStr(), note: "" } })}>مكافأة / خصم</Btn>}
+                  <Btn small variant="ghost" onClick={() => setStatementFor(it)}>كشف حساب</Btn>
+                </div>
+              </td>
+            </>
+          );
+        }} />
+      <div style={{ marginTop: 10, fontSize: 13, color: "#7A7061" }}>إجمالي المستحق للموظفين حاليًا: <b>{fmtNum(totalDue)} ر.س</b></div>
+
       {modal && (
         <Modal title={modal.mode === "add" ? "إضافة موظف" : "تعديل موظف"} onClose={() => setModal(null)}>
           <FormFields fields={fields} values={modal.values} setValues={(v) => setModal({ ...modal, values: v })} />
+          <Field label="الفروع التي يعمل بها (يمكن اختيار أكثر من فرع)">
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 12 }}>
+              {data.branches.map((b) => {
+                const cur = empBranches(data, modal.values);
+                const on = cur.includes(b.id);
+                return <label key={b.id} style={{ display: "inline-flex", alignItems: "center", gap: 6, fontSize: 13.5 }}><input type="checkbox" checked={on} onChange={(ev) => { const next = ev.target.checked ? [...cur, b.id] : cur.filter((x) => x !== b.id); setModal({ ...modal, values: { ...modal.values, branches: next, branch: next[0] || "", branchShares: next.length > 1 ? equalShares(next) : {} } }); }} />{b.name}</label>;
+              })}
+            </div>
+          </Field>
+          {empBranches(data, modal.values).length > 1 && (
+            <Field label="نسبة توزيع راتبه ومكافآته على الفروع % (المجموع 100)">
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                {empBranches(data, modal.values).map((id) => (
+                  <div key={id} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 13 }}>
+                    <span style={{ minWidth: 70 }}>{data.branches.find((b) => b.id === id)?.name}</span>
+                    <TextInput type="number" value={modal.values.branchShares?.[id] ?? ""} onChange={(ev) => setModal({ ...modal, values: { ...modal.values, branchShares: { ...(modal.values.branchShares || {}), [id]: ev.target.value } } })} style={{ padding: "5px 8px" }} />
+                  </div>
+                ))}
+              </div>
+              <div style={{ fontSize: 12, marginTop: 4, color: Math.abs(empBranches(data, modal.values).reduce((t, id) => t + (Number(modal.values.branchShares?.[id]) || 0), 0) - 100) < 0.01 ? THEME.teal : THEME.red }}>
+                المجموع الحالي: {fmtNum(empBranches(data, modal.values).reduce((t, id) => t + (Number(modal.values.branchShares?.[id]) || 0), 0))}%
+              </div>
+            </Field>
+          )}
+          <div style={{ fontSize: 11.5, color: "#8A8071", marginBottom: 10 }}>يمكن الجمع بين أكثر من نظام. الراتب ونسبة الأرباح يُثبَّتان آخر الشهر، أما النسبة من الطلب والمبلغ الثابت لكل طلب فيدخلان حسابه فور تسليم القطعة له من المراسل.</div>
           <div style={{ display: "flex", gap: 8 }}><Btn variant="brass" onClick={() => save(modal.values)}>حفظ</Btn><Btn variant="ghost" onClick={() => setModal(null)}>إلغاء</Btn></div>
         </Modal>
       )}
+
+      {payModal && (
+        <Modal title={`صرف للموظف: ${payModal.employee.name}`} onClose={() => setPayModal(null)}>
+          <FormFields values={payModal.values} setValues={(v) => setPayModal({ ...payModal, values: v })} fields={[
+            { key: "kind", label: "نوع الصرف", type: "select", options: [{ value: "رواتب", label: "دفع مستحقات / راتب" }, { value: "سلفة موظف", label: "سلفة" }] },
+            { key: "accountId", label: "من حساب", type: "select", options: data.financeAccounts.map((a) => ({ value: a.id, label: a.name })) },
+            ...(empBranches(data, payModal.employee).length > 1 ? [{ key: "branch", label: "يُحمَّل على فرع", type: "select", options: empBranches(data, payModal.employee).map((id) => ({ value: id, label: data.branches.find((b) => b.id === id)?.name || id })) }] : []),
+            { key: "amount", label: "المبلغ (ر.س)", type: "number" }, { key: "date", label: "التاريخ", type: "date" }, { key: "note", label: "ملاحظة (اختياري)" },
+          ]} />
+          <div style={{ fontSize: 12.5, color: "#7A7061", marginBottom: 10 }}>الرصيد الحالي: {fmtNum(employeeBalance(data, payModal.employee))} ر.س — يُنشأ سند صرف برقم تسلسلي ويُخصم من الحساب.</div>
+          <div style={{ display: "flex", gap: 8 }}><Btn variant="brass" onClick={savePayment}>حفظ وإصدار السند</Btn><Btn variant="ghost" onClick={() => setPayModal(null)}>إلغاء</Btn></div>
+        </Modal>
+      )}
+
+      {adjModal && (
+        <Modal title={`مكافأة / خصم: ${adjModal.employee.name}`} onClose={() => setAdjModal(null)}>
+          <FormFields values={adjModal.values} setValues={(v) => setAdjModal({ ...adjModal, values: v })} fields={[
+            { key: "kind", label: "النوع", type: "select", options: [{ value: "مكافأة", label: "مكافأة (تزيد مستحقاته)" }, { value: "خصم", label: "خصم / جزاء (يُنقص مستحقاته)" }] },
+            { key: "amount", label: "المبلغ (ر.س)", type: "number" }, { key: "date", label: "التاريخ", type: "date" }, { key: "note", label: "السبب" },
+          ]} />
+          <div style={{ display: "flex", gap: 8 }}><Btn variant="brass" onClick={saveAdjustment}>حفظ</Btn><Btn variant="ghost" onClick={() => setAdjModal(null)}>إلغاء</Btn></div>
+        </Modal>
+      )}
+
+      {salaryModal && (
+        <Modal title="إثبات رواتب الشهر" onClose={() => setSalaryModal(null)} wide>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+            <Field label="الشهر"><TextInput type="month" value={salaryModal.month} onChange={(e) => setSalaryModal({ ...salaryModal, month: e.target.value })} /></Field>
+            <Field label="عدد أيام الشهر (للقسمة)"><TextInput type="number" value={salaryModal.monthDays} onChange={(e) => setSalaryModal({ ...salaryModal, monthDays: e.target.value })} /></Field>
+          </div>
+          {Object.keys(salaryModal.rows).length === 0 ? <EmptyState text="لا يوجد موظفون لديهم راتب شهري" /> : (
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13.5 }}>
+              <thead><tr style={{ background: "#EFE7D6" }}><th style={{ padding: 8, textAlign: "right" }}></th><th style={{ padding: 8, textAlign: "right" }}>الموظف</th><th style={{ padding: 8, textAlign: "right" }}>الراتب</th><th style={{ padding: 8, textAlign: "right" }}>أيام الدوام</th><th style={{ padding: 8, textAlign: "right" }}>المستحق</th></tr></thead>
+              <tbody>
+                {data.employees.filter((e) => salaryModal.rows[e.id]).map((e) => {
+                  const r = salaryModal.rows[e.id]; const done = salaryDone(e.id, salaryModal.month);
+                  const amount = round2(Number(e.baseSalary) / (Number(salaryModal.monthDays) || 30) * (Number(r.days) || 0));
+                  const setRow = (patch) => setSalaryModal({ ...salaryModal, rows: { ...salaryModal.rows, [e.id]: { ...r, ...patch } } });
+                  return (
+                    <tr key={e.id} style={{ borderTop: `1px solid ${THEME.border}`, opacity: done ? 0.5 : 1 }}>
+                      <td style={{ padding: 8 }}><input type="checkbox" checked={r.include && !done} disabled={done} onChange={(ev) => setRow({ include: ev.target.checked })} /></td>
+                      <td style={{ padding: 8, fontWeight: 600 }}>{e.name}{done && <Badge color={THEME.teal}> مُثبت</Badge>}</td>
+                      <td style={{ padding: 8 }}>{fmtNum(e.baseSalary)}</td>
+                      <td style={{ padding: 8, width: 90 }}><TextInput type="number" value={r.days} disabled={done} onChange={(ev) => setRow({ days: ev.target.value })} style={{ padding: "5px 8px" }} /></td>
+                      <td style={{ padding: 8, fontWeight: 700 }}>{fmtNum(amount)} ر.س</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+          <div style={{ fontSize: 11.5, color: "#8A8071", margin: "10px 0" }}>المستحق = الراتب ÷ أيام الشهر × أيام الدوام. لا يمكن إثبات راتب نفس الشهر مرتين لنفس الموظف.</div>
+          <div style={{ display: "flex", gap: 8 }}><Btn variant="brass" onClick={saveSalaries}>إثبات الرواتب في الحسابات</Btn><Btn variant="ghost" onClick={() => setSalaryModal(null)}>إلغاء</Btn></div>
+        </Modal>
+      )}
+
+      {profitModal && (() => {
+        const line = (label, v, minus) => <div style={{ display: "flex", justifyContent: "space-between", padding: "4px 0", borderBottom: `1px dashed ${THEME.border}`, fontSize: 13.5 }}><span>{label}</span><b>{minus ? "− " : ""}{fmtNum(v)} ر.س</b></div>;
+        const brs = profitBranches();
+        return (
+          <Modal title="إثبات نسبة الأرباح — لكل فرع" onClose={() => setProfitModal(null)} wide>
+            <Field label="الشهر"><TextInput type="month" value={profitModal.month} onChange={(ev) => { const m = ev.target.value; setProfitModal({ ...profitModal, month: m, profits: calcProfits(m) }); }} /></Field>
+            {brs.length === 0 ? <EmptyState text="لا يوجد موظفون لديهم نسبة من الأرباح — أضفها من تعديل الموظف" /> : brs.map((br) => {
+              const c = computeProfit(profitModal.month, br.id);
+              const base = Number(profitModal.profits[br.id]) || 0;
+              const list = data.employees.filter((e) => empBranches(data, e).includes(br.id) && Number(e.profitSharePercent) > 0);
+              return (
+                <Panel key={br.id} style={{ marginBottom: 14 }}>
+                  <div style={{ fontWeight: 700, marginBottom: 8, color: THEME.brass }}>{br.name}</div>
+                  {line("إيرادات الطلبات (بعد الخصم، غير الملغاة)", c.revenue)}
+                  {line("مشتريات الفرع", c.purchases, true)}
+                  {line("مصروفات الفرع (سندات صرف غير الموظفين والموردين)", c.expenses, true)}
+                  {line("مستحقات موظفي الفرع (رواتب وقطع ونسب ومكافآت)", c.wages, true)}
+                  <div style={{ display: "flex", justifyContent: "space-between", padding: "8px 0", fontWeight: 700 }}><span>صافي ربح الفرع</span><span style={{ color: c.profit > 0 ? THEME.teal : THEME.red }}>{fmtNum(c.profit)} ر.س</span></div>
+                  <Field label="الربح المعتمد للتوزيع (يمكنك تعديله)"><TextInput type="number" value={profitModal.profits[br.id] ?? ""} onChange={(ev) => setProfitModal({ ...profitModal, profits: { ...profitModal.profits, [br.id]: ev.target.value } })} /></Field>
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13.5 }}>
+                    <tbody>
+                      {list.map((e) => { const done = profitDone(e.id, profitModal.month, br.id); const ik = `${e.id}:${br.id}`; return (
+                        <tr key={e.id} style={{ borderTop: `1px solid ${THEME.border}`, opacity: done ? 0.5 : 1 }}>
+                          <td style={{ padding: 8, width: 30 }}><input type="checkbox" disabled={done} checked={profitModal.include[ik] !== false && !done} onChange={(ev) => setProfitModal({ ...profitModal, include: { ...profitModal.include, [ik]: ev.target.checked } })} /></td>
+                          <td style={{ padding: 8, fontWeight: 600 }}>{e.name}{done && <Badge color={THEME.teal}> مُثبت</Badge>}</td>
+                          <td style={{ padding: 8 }}>{e.profitSharePercent}%</td>
+                          <td style={{ padding: 8, fontWeight: 700 }}>{fmtNum(base > 0 ? base * Number(e.profitSharePercent) / 100 : 0)} ر.س</td>
+                        </tr>); })}
+                    </tbody>
+                  </table>
+                </Panel>
+              );
+            })}
+            <div style={{ fontSize: 11.5, color: "#8A8071", margin: "10px 0" }}>كل موظف يأخذ نسبته من ربح فرعه، والموظف الذي يعمل في أكثر من فرع يأخذ نسبته من ربح كل فرع يعمل به (قيد منفصل لكل فرع). مستحقات الراتب والمكافآت له توزَّع على فروعه بالنسب المحددة في بياناته عند حساب الربح، أما أجر القطعة والنسبة فتُحسب على فرع الطلب. يُفضَّل إثبات الرواتب أولًا حتى تدخل في حساب الربح. لا يمكن إثبات نسبة نفس الشهر مرتين للموظف.</div>
+            <div style={{ display: "flex", gap: 8 }}><Btn variant="brass" onClick={saveProfit}>إثبات في الحسابات</Btn><Btn variant="ghost" onClick={() => setProfitModal(null)}>إلغاء</Btn></div>
+          </Modal>
+        );
+      })()}
+
+      {statementFor && (() => {
+        const e = data.employees.find((x) => x.id === statementFor.id) || statementFor;
+        return (
+          <StatementView data={data} title={`كشف حساب الموظف — ${e.name}`} onClose={() => setStatementFor(null)}
+            partyLines={[`${e.role}${e.phone ? ` — ${e.phone}` : ""}`, e.idNumber ? `هوية: ${e.idNumber}` : "", `فروعه: ${empBranches(data, e).map((id) => data.branches.find((b) => b.id === id)?.name).filter(Boolean).join("، ")}`, `نظام الأجر: ${payTypeText(e)}`]}
+            rows={employeeStatement(data, e).rows} opening={e.openingBalance}
+            labels={{ inc: "له (مستحق)", dec: "عليه (مدفوع / مخصوم)", balanceText: (b) => `الرصيد: ${fmtNum(b)} ر.س ${b > 0 ? "(مستحق للموظف)" : b < 0 ? "(مستحق على الموظف)" : ""}` }}
+            renderAction={(r) => r.isVoucher
+              ? <button onClick={() => setPrintingVoucher(r.voucher)} title="طباعة السند" style={{ background: "none", border: "none", cursor: "pointer" }}><Printer size={14} /></button>
+              : (canEdit && <button onClick={() => removeEntry(r)} title="حذف القيد" style={{ background: "none", border: "none", cursor: "pointer", color: THEME.red }}><Trash2 size={14} /></button>)} />
+        );
+      })()}
+      {printingVoucher && <VoucherPrintModal data={data} voucher={printingVoucher} onClose={() => setPrintingVoucher(null)} />}
     </>
   );
 }
@@ -1274,6 +2059,7 @@ function SuppliersView({ data, update, canEdit }) {
   const categories = ["قماش", "أزرار", "خيوط", "بطانة", "أخرى"];
   const pFields = [
     { key: "supplierId", label: "المورد", type: "select", options: data.suppliers.map((s) => ({ value: s.id, label: s.name })) },
+    { key: "branch", label: "الفرع (لحساب أرباح الفرع)", type: "select", options: data.branches.map((b) => ({ value: b.id, label: b.name })) },
     { key: "category", label: "التصنيف", type: "select", options: categories.map((c) => ({ value: c, label: c })) },
     { key: "item", label: "الصنف" }, { key: "qty", label: "الكمية", type: "number" },
     { key: "unit", label: "الوحدة (متر، قطعة...)" }, { key: "cost", label: "التكلفة (ر.س)", type: "number" },
@@ -1304,10 +2090,10 @@ function SuppliersView({ data, update, canEdit }) {
   const savePayment = () => {
     const amt = Number(payModal.values.amount);
     if (!amt || amt <= 0) { alert("أدخل مبلغًا صحيحًا"); return; }
-    const voucher = { id: uid("v"), type: "صرف", accountId: payModal.values.accountId, branch: data.branches[0]?.id, category: "دفعة لمورد", amount: amt, description: `دفعة للمورد ${payModal.supplier.name}`, date: payModal.values.date || new Date().toISOString().slice(0, 10), supplierId: payModal.supplier.id };
-    const vouchers = [...data.vouchers, voucher];
+    const bv = buildVoucher(data.counters, { type: "صرف", accountId: payModal.values.accountId, branch: data.branches[0]?.id, category: "دفعة لمورد", amount: amt, description: `دفعة للمورد ${payModal.supplier.name}`, date: payModal.values.date || todayStr(), supplierId: payModal.supplier.id, partyType: "مورد", partyId: payModal.supplier.id });
+    const vouchers = [...data.vouchers, bv.voucher];
     const financeAccounts = data.financeAccounts.map((a) => a.id === payModal.values.accountId ? { ...a, balance: (Number(a.balance) || 0) - amt } : a);
-    update({ vouchers, financeAccounts });
+    update({ vouchers, financeAccounts, counters: bv.counters });
     setPayModal(null);
   };
 
@@ -1363,7 +2149,7 @@ function SuppliersView({ data, update, canEdit }) {
       </Panel>
 
       <CrudSection icon={Truck} title="سجل المشتريات" addLabel="عملية شراء" columns={["الرقم", "المورد", "التصنيف", "الصنف", "الكمية", "التكلفة", "التاريخ", "مرفق"]} items={data.purchases} searchKeys={["item", "purchaseNo"]}
-        onAdd={canEdit ? () => data.suppliers.length ? setPModal({ mode: "add", values: { category: categories[0], supplierId: data.suppliers[0]?.id || "" } }) : alert("أضف موردًا أولاً") : undefined}
+        onAdd={canEdit ? () => data.suppliers.length ? setPModal({ mode: "add", values: { category: categories[0], supplierId: data.suppliers[0]?.id || "", branch: data.branches[0]?.id || "", date: todayStr() } }) : alert("أضف موردًا أولاً") : undefined}
         onEdit={canEdit ? (it) => setPModal({ mode: "edit", values: it }) : undefined}
         onDelete={canEdit ? (it) => update({ purchases: data.purchases.filter((p) => p.id !== it.id) }) : undefined}
         renderRow={(it) => (<><td style={{ padding: "10px 14px", fontWeight: 700, color: THEME.brass }}>#{it.purchaseNo || it.id.slice(-6)}</td><td style={{ padding: "10px 14px" }}>{data.suppliers.find((s) => s.id === it.supplierId)?.name || "—"}</td><td style={{ padding: "10px 14px" }}>{it.category}</td><td style={{ padding: "10px 14px" }}>{it.item}</td><td style={{ padding: "10px 14px" }}>{it.qty} {it.unit}</td><td style={{ padding: "10px 14px" }}>{it.cost} ر.س</td><td style={{ padding: "10px 14px" }}>{it.date}</td><td style={{ padding: "10px 14px" }}><Btn small variant="ghost" onClick={() => setPrintingPurchase(it)}><Printer size={13} />{it.attachment ? "📎" : ""}</Btn></td></>)} />
@@ -1384,39 +2170,20 @@ function SuppliersView({ data, update, canEdit }) {
         </Modal>
       )}
       {statementFor && (() => {
-        const s = statementFor;
+        const sp = statementFor;
+        const def = data.branches[0]?.id;
         const rows = [
-          ...data.purchases.filter((p) => p.supplierId === s.id).map((p) => ({ date: p.date, desc: `شراء: ${p.item}`, debit: Number(p.cost) || 0, credit: 0 })),
-          ...data.vouchers.filter((v) => v.type === "صرف" && v.supplierId === s.id).map((v) => ({ date: v.date, desc: "دفعة مسدّدة", debit: 0, credit: Number(v.amount) || 0 })),
-        ].sort((a, b) => (a.date || "").localeCompare(b.date || ""));
-        let running = Number(s.openingBalance) || 0;
-        const withRunning = rows.map((r) => { running += r.debit - r.credit; return { ...r, running }; });
+          ...data.purchases.filter((x) => x.supplierId === sp.id).map((x) => ({ key: x.id, no: x.purchaseNo, noLabel: "شراء", date: x.date, createdAt: "", desc: `شراء: ${x.item}${x.qty ? ` (${x.qty} ${x.unit || ""})` : ""}`, kind: `شراء ${x.category || ""}`.trim(), inc: Number(x.cost) || 0, dec: 0, branch: x.branch || def })),
+          ...data.vouchers.filter((v) => v.type === "صرف" && v.supplierId === sp.id).map((v) => ({ key: v.id, no: v.voucherNo, noLabel: "سند", date: v.date, createdAt: v.createdAt || "", desc: v.description || "دفعة مسدّدة", kind: "سداد", inc: 0, dec: Number(v.amount) || 0, branch: v.branch || def })),
+        ].sort((a, b) => (a.date || "").localeCompare(b.date || "") || (a.createdAt || "").localeCompare(b.createdAt || ""));
         return (
-          <Modal title={`كشف حساب المورد — ${s.name}`} onClose={() => setStatementFor(null)} wide>
-            <div style={{ fontSize: 13.5, marginBottom: 10 }}>الرصيد الافتتاحي: <b>{(Number(s.openingBalance) || 0).toLocaleString()} ر.س</b></div>
-            <div style={{ maxHeight: 360, overflowY: "auto" }}>
-              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
-                <thead><tr style={{ background: "#EFE7D6" }}><th style={{ padding: "8px 10px", textAlign: "right" }}>التاريخ</th><th style={{ padding: "8px 10px", textAlign: "right" }}>البيان</th><th style={{ padding: "8px 10px", textAlign: "right" }}>مدين (زيادة)</th><th style={{ padding: "8px 10px", textAlign: "right" }}>دائن (سداد)</th><th style={{ padding: "8px 10px", textAlign: "right" }}>الرصيد</th></tr></thead>
-                <tbody>
-                  {withRunning.length === 0 ? <tr><td colSpan={5} style={{ padding: 14, textAlign: "center", color: "#8A8071" }}>لا توجد حركات بعد</td></tr> : withRunning.map((r, i) => (
-                    <tr key={i} style={{ borderTop: `1px solid ${THEME.border}` }}>
-                      <td style={{ padding: "7px 10px" }}>{r.date || "—"}</td>
-                      <td style={{ padding: "7px 10px" }}>{r.desc}</td>
-                      <td style={{ padding: "7px 10px" }}>{r.debit ? r.debit.toLocaleString() : "—"}</td>
-                      <td style={{ padding: "7px 10px" }}>{r.credit ? r.credit.toLocaleString() : "—"}</td>
-                      <td style={{ padding: "7px 10px", fontWeight: 700 }}>{r.running.toLocaleString()}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            <div style={{ marginTop: 12, fontSize: 15, fontWeight: 700, color: THEME.brass }}>الرصيد الحالي المستحق: {supplierBalance(s).toLocaleString()} ر.س</div>
-            <Btn variant="brass" small onClick={() => window.print && window.print()} style={{ marginTop: 12 }}><Printer size={14} />طباعة الكشف</Btn>
-          </Modal>
+          <StatementView data={data} title={`كشف حساب المورد — ${sp.name}`} onClose={() => setStatementFor(null)}
+            partyLines={[sp.materialType, sp.phone]} rows={rows} opening={sp.openingBalance}
+            labels={{ inc: "مدين (مشتريات)", dec: "دائن (سداد)", balanceText: (b) => `الرصيد المستحق للمورد: ${fmtNum(b)} ر.س` }} />
         );
       })()}
       {printingPurchase && (
-        <RecordPrintModal data={data} title="سند شراء" refLabel="عملية شراء" refNo={printingPurchase.purchaseNo || printingPurchase.id.slice(-6)} attachment={printingPurchase.attachment} onClose={() => setPrintingPurchase(null)}
+        <RecordPrintModal data={data} signatures={["توقيع المورد / المستلم", "توقيع المحاسب"]} title="سند شراء" refLabel="عملية شراء" refNo={printingPurchase.purchaseNo || printingPurchase.id.slice(-6)} attachment={printingPurchase.attachment} onClose={() => setPrintingPurchase(null)}
           rows={[
             { label: "المورد", value: data.suppliers.find((s) => s.id === printingPurchase.supplierId)?.name || "—" },
             { label: "التصنيف", value: printingPurchase.category },
@@ -1510,7 +2277,7 @@ function FinanceCharts({ data }) {
   );
 }
 
-function FinanceView({ data, update, canEdit }) {
+function FinanceView({ data, update, canEdit, currentUser }) {
   const [vModal, setVModal] = useState(null);
   const [jModal, setJModal] = useState(null);
   const [printingVoucher, setPrintingVoucher] = useState(null);
@@ -1524,9 +2291,14 @@ function FinanceView({ data, update, canEdit }) {
     { key: "amount", label: "المبلغ (ر.س)", type: "number" }, { key: "description", label: "البيان" }, { key: "date", label: "التاريخ", type: "date" },
   ];
   const saveVoucher = (values) => {
-    const vouchers = [...data.vouchers, { id: uid("v"), ...values }];
+    if (!Number(values.amount) || Number(values.amount) <= 0) { alert("أدخل مبلغًا صحيحًا"); return; }
+    const extra = {};
+    if (values.partyType === "موظف" && values.partyId) extra.employeeId = values.partyId;
+    if (values.partyType === "مورد" && values.partyId) extra.supplierId = values.partyId;
+    const bv = buildVoucher(data.counters, { ...values, ...extra, date: values.date || todayStr() }, currentUser);
+    const vouchers = [...data.vouchers, bv.voucher];
     const accounts = data.financeAccounts.map((a) => a.id === values.accountId ? { ...a, balance: (Number(a.balance) || 0) + (values.type === "قبض" ? Number(values.amount) : -Number(values.amount)) } : a);
-    update({ vouchers, financeAccounts: accounts }); setVModal(null);
+    update({ vouchers, financeAccounts: accounts, counters: bv.counters }); setVModal(null);
   };
   const jFields = [
     { key: "fromAccount", label: "من حساب", type: "select", options: data.financeAccounts.map((a) => ({ value: a.id, label: a.name })) },
@@ -1535,13 +2307,14 @@ function FinanceView({ data, update, canEdit }) {
   ];
   const saveJournal = (values) => {
     if (values.fromAccount === values.toAccount) { alert("اختر حسابين مختلفين"); return; }
-    const entries = [...data.journalEntries, { id: uid("j"), ...values }];
+    const jn = nextCounter(data.counters, "journal");
+    const entries = [...data.journalEntries, { id: uid("j"), journalNo: jn.no, createdBy: currentUser || "", ...values }];
     const accounts = data.financeAccounts.map((a) => {
       if (a.id === values.fromAccount) return { ...a, balance: (Number(a.balance) || 0) - Number(values.amount) };
       if (a.id === values.toAccount) return { ...a, balance: (Number(a.balance) || 0) + Number(values.amount) };
       return a;
     });
-    update({ journalEntries: entries, financeAccounts: accounts }); setJModal(null);
+    update({ journalEntries: entries, financeAccounts: accounts, counters: jn.counters }); setJModal(null);
   };
 
   const [dateFrom, setDateFrom] = useState("");
@@ -1579,14 +2352,17 @@ function FinanceView({ data, update, canEdit }) {
         <div style={{ marginTop: 10, fontSize: 12.5, color: "#7A7061" }}>خيارات الدفع تابي وتمارا متاحة عند الفوترة؛ تفعيلها الفعلي يتطلب ربط API مع حساب تاجر معتمد لدى كل مزوّد.</div>
       </Panel>
 
-      <CrudSection icon={Wallet} title="السندات (قبض / صرف)" addLabel="سند جديد" columns={["النوع", "الحساب", "الفرع", "التصنيف", "المبلغ", "البيان", "التاريخ", "طباعة"]} items={data.vouchers} searchKeys={["description"]}
-        onAdd={canEdit ? () => setVModal({ mode: "add", values: { type: "قبض", accountId: data.financeAccounts[0]?.id, branch: data.branches[0]?.id, category: incomeCategories[2] } }) : undefined}
-        renderRow={(it) => (<><td style={{ padding: "10px 14px" }}><Badge color={it.type === "قبض" ? THEME.teal : THEME.red}>{it.type}</Badge></td><td style={{ padding: "10px 14px" }}>{data.financeAccounts.find((a) => a.id === it.accountId)?.name}</td><td style={{ padding: "10px 14px" }}>{data.branches.find((b) => b.id === it.branch)?.name}</td><td style={{ padding: "10px 14px" }}>{it.category || "—"}</td><td style={{ padding: "10px 14px" }}>{it.amount} ر.س</td><td style={{ padding: "10px 14px" }}>{it.description}</td><td style={{ padding: "10px 14px" }}>{it.date}</td><td style={{ padding: "10px 14px" }}><Btn small variant="ghost" onClick={() => setPrintingVoucher(it)}><Printer size={13} /></Btn></td></>)} />
+      <CrudSection icon={Wallet} title="السندات (قبض / صرف)" addLabel="سند جديد" columns={["الرقم", "النوع", "الطرف", "الحساب", "التصنيف", "المبلغ", "البيان", "التاريخ", "طباعة"]} items={data.vouchers} searchKeys={["description", "voucherNo", "partyName"]}
+        onAdd={canEdit ? () => setVModal({ mode: "add", values: { type: "قبض", accountId: data.financeAccounts[0]?.id, branch: data.branches[0]?.id, category: incomeCategories[2], date: todayStr() } }) : undefined}
+        renderRow={(it) => {
+          const pr = voucherPartyInfo(data, it);
+          return (<><td style={{ padding: "10px 14px", fontWeight: 700, color: THEME.brass }}>{it.voucherNo || "—"}</td><td style={{ padding: "10px 14px" }}><Badge color={it.type === "قبض" ? THEME.teal : THEME.red}>{it.type}</Badge></td><td style={{ padding: "10px 14px", fontSize: 13 }}>{pr.find((r) => r.label === "الاسم")?.value || "—"}</td><td style={{ padding: "10px 14px" }}>{data.financeAccounts.find((a) => a.id === it.accountId)?.name}</td><td style={{ padding: "10px 14px" }}>{it.category || "—"}</td><td style={{ padding: "10px 14px" }}>{fmtNum(it.amount)} ر.س</td><td style={{ padding: "10px 14px" }}>{it.description}</td><td style={{ padding: "10px 14px" }}>{it.date}</td><td style={{ padding: "10px 14px" }}><Btn small variant="ghost" onClick={() => setPrintingVoucher(it)}><Printer size={13} /></Btn></td></>);
+        }} />
 
       <div style={{ height: 20 }} />
-      <CrudSection icon={Wallet} title="قيود التحويل بين الحسابات" addLabel="قيد جديد" columns={["من", "إلى", "المبلغ", "البيان", "التاريخ", "طباعة"]} items={data.journalEntries} searchKeys={["description"]}
+      <CrudSection icon={Wallet} title="قيود التحويل بين الحسابات" addLabel="قيد جديد" columns={["الرقم", "من", "إلى", "المبلغ", "البيان", "التاريخ", "طباعة"]} items={data.journalEntries} searchKeys={["description", "journalNo"]}
         onAdd={canEdit ? () => setJModal({ mode: "add", values: { fromAccount: data.financeAccounts[0]?.id, toAccount: data.financeAccounts[1]?.id || data.financeAccounts[0]?.id } }) : undefined}
-        renderRow={(it) => (<><td style={{ padding: "10px 14px" }}>{data.financeAccounts.find((a) => a.id === it.fromAccount)?.name}</td><td style={{ padding: "10px 14px" }}>{data.financeAccounts.find((a) => a.id === it.toAccount)?.name}</td><td style={{ padding: "10px 14px" }}>{it.amount} ر.س</td><td style={{ padding: "10px 14px" }}>{it.description}</td><td style={{ padding: "10px 14px" }}>{it.date}</td><td style={{ padding: "10px 14px" }}><Btn small variant="ghost" onClick={() => setPrintingJournal(it)}><Printer size={13} /></Btn></td></>)} />
+        renderRow={(it) => (<><td style={{ padding: "10px 14px", fontWeight: 700, color: THEME.brass }}>{it.journalNo || "—"}</td><td style={{ padding: "10px 14px" }}>{data.financeAccounts.find((a) => a.id === it.fromAccount)?.name}</td><td style={{ padding: "10px 14px" }}>{data.financeAccounts.find((a) => a.id === it.toAccount)?.name}</td><td style={{ padding: "10px 14px" }}>{it.amount} ر.س</td><td style={{ padding: "10px 14px" }}>{it.description}</td><td style={{ padding: "10px 14px" }}>{it.date}</td><td style={{ padding: "10px 14px" }}><Btn small variant="ghost" onClick={() => setPrintingJournal(it)}><Printer size={13} /></Btn></td></>)} />
 
       {vModal && (
         <Modal title="سند جديد" onClose={() => setVModal(null)}>
@@ -1594,6 +2370,7 @@ function FinanceView({ data, update, canEdit }) {
           <Field label={vModal.values.type === "صرف" ? "تصنيف المصروف" : "تصنيف الوارد"}>
             <SelectInput options={(vModal.values.type === "صرف" ? expenseCategories : incomeCategories).map((c) => ({ value: c, label: c }))} value={vModal.values.category || ""} onChange={(e) => setVModal({ ...vModal, values: { ...vModal.values, category: e.target.value } })} />
           </Field>
+          <PartyPicker data={data} values={vModal.values} setValues={(v) => setVModal({ ...vModal, values: v })} />
           <AttachmentField value={vModal.values.attachment} onChange={(att) => setVModal({ ...vModal, values: { ...vModal.values, attachment: att } })} />
           <div style={{ display: "flex", gap: 8 }}><Btn variant="brass" onClick={() => saveVoucher(vModal.values)}>حفظ</Btn><Btn variant="ghost" onClick={() => setVModal(null)}>إلغاء</Btn></div>
         </Modal>
@@ -1605,25 +2382,13 @@ function FinanceView({ data, update, canEdit }) {
           <div style={{ display: "flex", gap: 8 }}><Btn variant="brass" onClick={() => saveJournal(jModal.values)}>حفظ</Btn><Btn variant="ghost" onClick={() => setJModal(null)}>إلغاء</Btn></div>
         </Modal>
       )}
-      {printingVoucher && (
-        <RecordPrintModal data={data} title={printingVoucher.type === "قبض" ? "سند قبض" : "سند صرف"} refLabel={printingVoucher.type === "قبض" ? "سند قبض" : "سند صرف"} refNo={printingVoucher.id.slice(-6)} attachment={printingVoucher.attachment} onClose={() => setPrintingVoucher(null)}
-          rows={[
-            { label: "الحساب", value: data.financeAccounts.find((a) => a.id === printingVoucher.accountId)?.name || "—" },
-            { label: "الفرع", value: data.branches.find((b) => b.id === printingVoucher.branch)?.name || "—" },
-            { label: "التصنيف", value: printingVoucher.category || "—" },
-            { label: "المبلغ", value: `${printingVoucher.amount || 0} ر.س` },
-            { label: "البيان", value: printingVoucher.description || "—" },
-            { label: "التاريخ", value: printingVoucher.date || "—" },
-          ]} />
-      )}
+      {printingVoucher && <VoucherPrintModal data={data} voucher={printingVoucher} onClose={() => setPrintingVoucher(null)} />}
       {printingJournal && (
-        <RecordPrintModal data={data} title="قيد تحويل" refLabel="قيد تحويل" refNo={printingJournal.id.slice(-6)} attachment={printingJournal.attachment} onClose={() => setPrintingJournal(null)}
+        <RecordPrintModal data={data} docType="journal" amount={Number(printingJournal.amount) || 0} date={printingJournal.date || ""} signatures={["أمين الصندوق / المحاسب", "المدير المعتمد"]} title="قيد تحويل" refLabel="قيد تحويل" refNo={printingJournal.journalNo || printingJournal.id.slice(-6)} attachment={printingJournal.attachment} onClose={() => setPrintingJournal(null)}
           rows={[
             { label: "من حساب", value: data.financeAccounts.find((a) => a.id === printingJournal.fromAccount)?.name || "—" },
             { label: "إلى حساب", value: data.financeAccounts.find((a) => a.id === printingJournal.toAccount)?.name || "—" },
-            { label: "المبلغ", value: `${printingJournal.amount || 0} ر.س` },
             { label: "البيان", value: printingJournal.description || "—" },
-            { label: "التاريخ", value: printingJournal.date || "—" },
           ]} />
       )}
     </div>
@@ -1641,7 +2406,15 @@ function UsersView({ data, update, canEdit, currentUser }) {
     perms[moduleId] = { ...perms[moduleId], [field]: !perms[moduleId]?.[field] };
     setModal({ ...modal, values: { ...values, permissions: perms } });
   };
-  const save = (values) => { const list = [...data.users]; if (modal.mode === "add") list.push({ id: uid("usr"), ...values }); else { const i = list.findIndex((u) => u.id === values.id); list[i] = values; } update({ users: list }); setModal(null); };
+  const save = async (values) => {
+    const list = [...data.users];
+    let toSave = { ...values };
+    if (toSave.password && toSave.password.trim()) { toSave.password = await hashPassword(toSave.password.trim()); }
+    else { const existing = data.users.find((u) => u.id === values.id); toSave.password = existing?.password || ""; }
+    if (modal.mode === "add") list.push({ id: uid("usr"), ...toSave });
+    else { const i = list.findIndex((u) => u.id === toSave.id); list[i] = toSave; }
+    update({ users: list }); setModal(null);
+  };
   const moduleLabels = { dashboard: "لوحة التحكم", customers: "العملاء", orders: "الطلبات", courier: "شاشة المراسل", appointments: "المواعيد", designs: "دليل التصاميم", invoices: "الفواتير", employees: "الموظفون", suppliers: "المشتريات", finance: "المالية", users: "المستخدمون", settings: "بيانات المحل", reports: "التقارير" };
 
   return (
@@ -1691,7 +2464,7 @@ function UsersView({ data, update, canEdit, currentUser }) {
 
       <CrudSection icon={ShieldCheck} title="المستخدمون والصلاحيات" addLabel="مستخدم جديد" columns={["الاسم", "اسم الدخول", "الجوال", "الدور", "الفروع المتاحة"]} items={data.users} searchKeys={["name", "username"]}
         onAdd={canEdit ? () => setModal({ mode: "add", values: { role: ROLES[0], branches: [], phone: "", password: "", permissions: defaultPermissions(ROLES[0]) } }) : undefined}
-        onEdit={canEdit ? (it) => setModal({ mode: "edit", values: it }) : undefined}
+        onEdit={canEdit ? (it) => setModal({ mode: "edit", values: { ...it, password: "" } }) : undefined}
         onDelete={canEdit ? (it) => update({ users: data.users.filter((u) => u.id !== it.id), auditLog: [...(data.auditLog || []), logEntry(currentUser, "حذف مستخدم", `${it.name} (${it.username})`)] }) : undefined}
         renderRow={(it) => (<><td style={{ padding: "10px 14px", fontWeight: 600 }}>{it.name}</td><td style={{ padding: "10px 14px" }}>{it.username}</td><td style={{ padding: "10px 14px" }}>{it.phone || "—"}</td><td style={{ padding: "10px 14px" }}><Badge>{it.role}</Badge></td><td style={{ padding: "10px 14px", fontSize: 12.5 }}>{(it.branches || []).map((id) => data.branches.find((b) => b.id === id)?.name).filter(Boolean).join("، ") || "—"}</td></>)} />
 
@@ -1702,7 +2475,7 @@ function UsersView({ data, update, canEdit, currentUser }) {
             <Field label="اسم الدخول"><TextInput value={modal.values.username || ""} onChange={(e) => setModal({ ...modal, values: { ...modal.values, username: e.target.value } })} /></Field>
             <Field label="الدور"><SelectInput options={ROLES.map((r) => ({ value: r, label: r }))} value={modal.values.role || ROLES[0]} onChange={(e) => setModal({ ...modal, values: { ...modal.values, role: e.target.value, permissions: defaultPermissions(e.target.value) } })} /></Field>
             <Field label="رقم الجوال (لاستعادة كلمة المرور)"><TextInput value={modal.values.phone || ""} onChange={(e) => setModal({ ...modal, values: { ...modal.values, phone: e.target.value } })} /></Field>
-            <Field label="كلمة المرور"><TextInput type="text" value={modal.values.password || ""} onChange={(e) => setModal({ ...modal, values: { ...modal.values, password: e.target.value } })} /></Field>
+            <Field label={modal.mode === "edit" ? "كلمة مرور جديدة (اتركه فارغًا للإبقاء على الحالية)" : "كلمة المرور"}><TextInput type="text" value={modal.values.password || ""} onChange={(e) => setModal({ ...modal, values: { ...modal.values, password: e.target.value } })} /></Field>
           </div>
           <Field label="الفروع المسموح بالدخول لها">
             <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
@@ -1879,6 +2652,7 @@ function ShopSettingsView({ data, update, canEdit }) {
           {saved && <span style={{ color: THEME.teal, fontSize: 13 }}>تم الحفظ ✓</span>}
         </div>
       </Panel>
+      <PrintTemplatesPanel data={data} update={update} />
     </div>
   );
 }
@@ -1979,19 +2753,40 @@ function LoginScreen({ data, update, onLogin }) {
   const [error, setError] = useState("");
   const [foundUser, setFoundUser] = useState(null);
 
-  const submitLogin = () => {
-    const user = data.users.find((u) => u.username === username.trim() && (u.password || "") === password);
-    if (user) { setError(""); onLogin(user.id); }
-    else setError("اسم المستخدم أو كلمة المرور غير صحيحة");
+  const submitLogin = async () => {
+    const user = data.users.find((u) => u.username === username.trim());
+    if (!user) { setError("اسم المستخدم أو كلمة المرور غير صحيحة"); return; }
+    if (user.lockedUntil && Date.now() < user.lockedUntil) {
+      const mins = Math.ceil((user.lockedUntil - Date.now()) / 60000);
+      setError(`تم قفل الحساب مؤقتًا بسبب محاولات فاشلة متكررة — حاول بعد ${mins} دقيقة تقريبًا.`);
+      return;
+    }
+    const ok = await verifyPassword(password, user.password);
+    if (ok) {
+      setError("");
+      let patch = { users: data.users.map((u) => u.id === user.id ? { ...u, failedAttempts: 0, lockedUntil: null } : u) };
+      if (!looksHashed(user.password)) {
+        const hash = await hashPassword(password);
+        patch = { users: patch.users.map((u) => u.id === user.id ? { ...u, password: hash } : u) };
+      }
+      update(patch);
+      onLogin(user.id);
+    } else {
+      const attempts = (user.failedAttempts || 0) + 1;
+      const lockedUntil = attempts >= 5 ? Date.now() + 5 * 60000 : null;
+      update({ users: data.users.map((u) => u.id === user.id ? { ...u, failedAttempts: lockedUntil ? 0 : attempts, lockedUntil } : u) });
+      setError(lockedUntil ? "محاولات فاشلة كثيرة — تم قفل الحساب 5 دقائق." : "اسم المستخدم أو كلمة المرور غير صحيحة");
+    }
   };
   const submitForgot = () => {
     const user = data.users.find((u) => u.username === username.trim() && (u.phone || "").trim() && (u.phone || "").trim() === phone.trim());
     if (user) { setFoundUser(user); setError(""); setMode("reset"); }
     else setError("لا يوجد مستخدم بهذا الاسم ورقم الجوال معًا — تأكد من تسجيل رقم الجوال مسبقًا من قسم المستخدمين");
   };
-  const submitReset = () => {
+  const submitReset = async () => {
     if (newPassword.trim().length < 4) { setError("كلمة المرور قصيرة جدًا — 4 أحرف على الأقل"); return; }
-    const users = data.users.map((u) => u.id === foundUser.id ? { ...u, password: newPassword.trim() } : u);
+    const hash = await hashPassword(newPassword.trim());
+    const users = data.users.map((u) => u.id === foundUser.id ? { ...u, password: hash, failedAttempts: 0, lockedUntil: null } : u);
     update({ users });
     onLogin(foundUser.id);
   };
@@ -2072,6 +2867,7 @@ export default function App() {
   const [sessionLoaded, setSessionLoaded] = useState(false);
   const [isOnline, setIsOnline] = useState(typeof navigator === "undefined" ? true : navigator.onLine);
   const [hasPendingSync, setHasPendingSync] = useState(false);
+  const [pwModal, setPwModal] = useState(null);
   const dataForSyncRef = useRef(null);
 
   React.useEffect(() => {
@@ -2114,6 +2910,15 @@ export default function App() {
         if (parsed.orders) { let o = parsed.counters.order; parsed.orders = parsed.orders.map((ord) => ord.orderNo ? ord : (o += 1, { ...ord, orderNo: o })); parsed.counters.order = o; }
         if (parsed.counters.purchase === undefined) parsed.counters.purchase = 1000;
         if (parsed.purchases) { let p = parsed.counters.purchase; parsed.purchases = parsed.purchases.map((pur) => pur.purchaseNo ? pur : (p += 1, { ...pur, purchaseNo: p })); parsed.counters.purchase = p; }
+        if (!parsed.employeeLedger) parsed.employeeLedger = [];
+        if (!parsed.printSettings) parsed.printSettings = { defaults: { invoice: ["classic", "modern", "minimal", "elegant"].includes(parsed.invoiceTheme) ? parsed.invoiceTheme : "classic" }, customTemplates: [] };
+        else { parsed.printSettings.defaults = parsed.printSettings.defaults || {}; parsed.printSettings.customTemplates = parsed.printSettings.customTemplates || []; }
+        if (!parsed.vouchers) parsed.vouchers = [];
+        if (parsed.counters.voucher === undefined) parsed.counters.voucher = 1000;
+        if (parsed.counters.journal === undefined) parsed.counters.journal = 1000;
+        if (parsed.counters.empEntry === undefined) parsed.counters.empEntry = 5000;
+        { let vn = parsed.counters.voucher; parsed.vouchers = parsed.vouchers.map((v) => v.voucherNo ? v : (vn += 1, { ...v, voucherNo: vn })); parsed.counters.voucher = vn; }
+        { let jn = parsed.counters.journal; parsed.journalEntries = parsed.journalEntries.map((j) => j.journalNo ? j : (jn += 1, { ...j, journalNo: jn })); parsed.counters.journal = jn; }
         if (parsed.users) parsed.users = parsed.users.map((u) => u.permissions && u.permissions.settings ? u : { ...u, permissions: { ...u.permissions, settings: u.role === "مدير عام" ? { view: true, edit: true } : { view: false, edit: false } } });
         setData(parsed);
       }
@@ -2208,15 +3013,29 @@ export default function App() {
     invoices: <InvoicesView data={data} update={update} />,
     employees: <EmployeesView data={data} update={update} canEdit={canEdit} currentUser={activeUser.name} />,
     suppliers: <SuppliersView data={data} update={update} canEdit={canEdit} />,
-    finance: <FinanceView data={data} update={update} canEdit={canEdit} />,
+    finance: <FinanceView data={data} update={update} canEdit={canEdit} currentUser={activeUser.name} />,
     users: <UsersView data={data} update={update} canEdit={canEdit} currentUser={activeUser.name} />,
     settings: <ShopSettingsView data={data} update={update} canEdit={canEdit} />,
     reports: <ReportsView data={data} />,
   };
 
   return (
-    <div dir="rtl" style={{ fontFamily: "Tajawal, sans-serif", background: THEME.parchment, minHeight: "100vh", color: THEME.ink }}>
-      <style>{`@import url('https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700&family=Amiri:wght@400;700&display=swap'); * { box-sizing: border-box; }`}</style>
+    <div className="app-root" dir="rtl" style={{ fontFamily: "Tajawal, sans-serif", background: THEME.parchment, minHeight: "100vh", color: THEME.ink }}>
+      <style>{`@import url('https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700&family=Amiri:wght@400;700&family=Cairo:wght@400;600;700&display=swap'); * { box-sizing: border-box; }
+        @page { size: A4; margin: 0; }
+        @media print {
+          html, body { height: auto !important; overflow: visible !important; background: #fff !important; }
+          * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+          body * { visibility: hidden; }
+          .printable, .printable * { visibility: visible; }
+          .app-root { height: 0 !important; min-height: 0 !important; overflow: hidden !important; }
+          .modal-overlay, .modal-box, .print-stage { position: static !important; overflow: visible !important; padding: 0 !important; background: none !important; border: none !important; max-width: none !important; }
+          .printable { position: absolute !important; top: 0; right: 0; left: 0; width: 210mm !important; margin: 0 !important; box-shadow: none !important; overflow: visible !important; }
+          .no-print { display: none !important; }
+          table { page-break-inside: auto; }
+          tr { page-break-inside: avoid; }
+        }
+      `}</style>
       <div style={{ display: "flex", minHeight: "100vh" }}>
         <div style={{ width: 240, background: THEME.ink, color: THEME.parchment, padding: "22px 14px", flexShrink: 0 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4, paddingRight: 6 }}>
@@ -2238,8 +3057,25 @@ export default function App() {
               <span style={{ fontSize: 12, background: "#C9A2271a", color: "#8A6D1F", padding: "4px 10px", borderRadius: 20 }}>🟡 جاري مزامنة تغييرات معلّقة...</span>
             ) : null}
             <span style={{ fontSize: 12.5, color: "#7A7061" }}>مسجّل الدخول: <b>{activeUser.name}</b> ({activeUser.role})</span>
+            <Btn small variant="ghost" onClick={() => setPwModal({ current: "", next: "", error: "" })}>تغيير كلمة المرور</Btn>
             <Btn small variant="ghost" onClick={handleLogout}>تسجيل الخروج</Btn>
           </div>
+          {pwModal && (
+            <Modal title="تغيير كلمة المرور" onClose={() => setPwModal(null)}>
+              <Field label="كلمة المرور الحالية"><TextInput type="password" value={pwModal.current} onChange={(e) => setPwModal({ ...pwModal, current: e.target.value })} /></Field>
+              <Field label="كلمة المرور الجديدة"><TextInput type="password" value={pwModal.next} onChange={(e) => setPwModal({ ...pwModal, next: e.target.value })} /></Field>
+              {pwModal.error && <div style={{ color: THEME.red, fontSize: 13, marginBottom: 10 }}>{pwModal.error}</div>}
+              <Btn variant="brass" onClick={async () => {
+                const ok = await verifyPassword(pwModal.current, activeUser.password);
+                if (!ok) { setPwModal({ ...pwModal, error: "كلمة المرور الحالية غير صحيحة" }); return; }
+                if (pwModal.next.trim().length < 4) { setPwModal({ ...pwModal, error: "كلمة المرور الجديدة قصيرة جدًا — 4 أحرف على الأقل" }); return; }
+                const hash = await hashPassword(pwModal.next.trim());
+                update({ users: data.users.map((u) => u.id === activeUser.id ? { ...u, password: hash } : u) });
+                setPwModal(null);
+                alert("تم تغيير كلمة المرور بنجاح.");
+              }}>حفظ</Btn>
+            </Modal>
+          )}
           {views[effectiveTab]}
         </div>
       </div>
