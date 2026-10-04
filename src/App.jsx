@@ -5,7 +5,7 @@ import { Html5QrcodeScanner, Html5QrcodeSupportedFormats } from "html5-qrcode";
 import {
   LayoutDashboard, Users, ShoppingBag, Shirt, Receipt, Briefcase,
   Truck, Wallet, ShieldCheck, BarChart3, Plus, Trash2, Pencil, Check,
-  Printer, X, Search, Package, Building2, Star, ChevronLeft, ScanLine, Upload, CalendarClock, Store
+  Printer, X, Search, Package, Building2, Star, ChevronLeft, ScanLine, Upload, CalendarClock, Store, RotateCcw
 } from "lucide-react";
 
 const STORAGE_KEY = "tailor-shop-data-v2";
@@ -51,7 +51,7 @@ function normalizeCounters(d) {
   const up = (key, arr, field, start) => { const top = Math.max(Number(c[key]) || start, ...(arr || []).map((x) => Number(x?.[field]) || 0)); c[key] = top; };
   up("order", d.orders, "orderNo", 1000); up("group", d.orderGroups, "groupNo", 1000); up("customer", d.customers, "code", 1000);
   up("purchase", d.purchases, "purchaseNo", 1000); up("voucher", d.vouchers, "voucherNo", 1000); up("journal", d.journalEntries, "journalNo", 1000);
-  up("empEntry", d.employeeLedger, "entryNo", 5000);
+  up("empEntry", d.employeeLedger, "entryNo", 5000); up("return", d.returns, "returnNo", 1000);
   const same = Object.keys(c).every((k) => c[k] === (d.counters || {})[k]);
   return same ? d : { ...d, counters: c };
 }
@@ -111,7 +111,7 @@ function mergeData(base, local, cloud) {
   const out = {}; Object.keys({ ...cloud, ...local }).forEach((k) => { const v = mergeValue(k, base[k], local[k], cloud[k]); if (v !== undefined) out[k] = v; });
   return out;
 }
-const NUMBERED = [["orders", "orderNo", "order", "طلب"], ["orderGroups", "groupNo", "group", "طلبية"], ["customers", "code", "customer", "كود عميل"], ["purchases", "purchaseNo", "purchase", "شراء"], ["vouchers", "voucherNo", "voucher", "سند"], ["journalEntries", "journalNo", "journal", "قيد"], ["employeeLedger", "entryNo", "empEntry", "قيد موظف"]];
+const NUMBERED = [["orders", "orderNo", "order", "طلب"], ["orderGroups", "groupNo", "group", "طلبية"], ["customers", "code", "customer", "كود عميل"], ["purchases", "purchaseNo", "purchase", "شراء"], ["vouchers", "voucherNo", "voucher", "سند"], ["journalEntries", "journalNo", "journal", "قيد"], ["employeeLedger", "entryNo", "empEntry", "قيد موظف"], ["returns", "returnNo", "return", "مرتجع"]];
 // If this device issued a number another device issued at the same time, the record that is NOT yet in the cloud takes a new number.
 function dedupeNumbers(d, cloud) {
   const notes = []; const counters = { ...(d.counters || {}) }; const out = { ...d };
@@ -154,7 +154,7 @@ function userBranchScope(data, user) {
   const ids = (user.branches || []).filter((id) => data.branches.some((b) => b.id === id));
   return ids.length ? ids : null;
 }
-const SCOPED_COLLECTIONS = ["orders", "orderGroups", "customers", "employees", "employeeLedger", "vouchers", "purchases", "appointments", "stockAdjustments"];
+const SCOPED_COLLECTIONS = ["orders", "orderGroups", "customers", "employees", "employeeLedger", "vouchers", "purchases", "appointments", "stockAdjustments", "returns"];
 const MASKED_KEYS = ["branches", "journalEntries"];   // hidden from restricted users; their writes are ignored
 function scopeData(data, allowed) {
   if (!allowed) return data;
@@ -175,6 +175,7 @@ function scopeData(data, allowed) {
     purchases: (data.purchases || []).filter((x) => A.has(x.branch || def)),
     appointments: (data.appointments || []).filter((a) => !a.branch || A.has(a.branch)),
     stockAdjustments: (data.stockAdjustments || []).filter((a) => A.has(a.branch || def)),
+    returns: (data.returns || []).filter((r) => A.has(r.branch || def)),
     journalEntries: [],
   };
 }
@@ -198,7 +199,7 @@ const PAYMENT_ACCOUNT_MAP = { "نقدي": "cash", "شبكة": "network", "تحو
 const ROLE_STAGE_MAP = { "قصّاص": "القص", "خياط": "الخياطة", "كاوي": "الكي", "زرّار": "تركيب الأزرار" };
 const STAGE_ROLE_MAP = Object.fromEntries(Object.entries(ROLE_STAGE_MAP).map(([role, stage]) => [stage, role]));
 
-const ALL_MODULES = ["dashboard", "customers", "orders", "courier", "appointments", "designs", "invoices", "employees", "suppliers", "inventory", "finance", "users", "settings", "reports"];
+const ALL_MODULES = ["dashboard", "customers", "orders", "courier", "appointments", "designs", "invoices", "employees", "suppliers", "inventory", "returns", "finance", "users", "settings", "reports"];
 const ROLES = ["مدير عام", "مدير فرع", "محاسب", "موظف استقبال"];
 
 function defaultPermissions(role) {
@@ -246,7 +247,7 @@ const seedData = () => ({
   counters: { customer: 1000, order: 1000, group: 1000, purchase: 1000, voucher: 1000, journal: 1000, empEntry: 5000 },
   employeeLedger: [],
   printSettings: { defaults: {}, customTemplates: [] },
-  inventoryItems: [], stockAdjustments: [], consumptionRules: [], freedNumbers: {},
+  inventoryItems: [], stockAdjustments: [], consumptionRules: [], freedNumbers: {}, returns: [], closedPeriods: [],
   freedCustomerCodes: [],
   orderGroups: [],
   auditLog: [],
@@ -549,6 +550,7 @@ function TemplatePicker({ data, value, onChange, docType }) {
 
 function PrintSheet({ data, tpl, preview, title, docNo, docNoLabel = "رقم", date, meta, parties, children, totals, amount, notes, signatures, barcode, attachment, showBank = true, footerNote }) {
   const t = tpl || BUILTIN_TEMPLATES[0];
+  const full = !!t.pageImage;   // a complete ready-made page design (letterhead, borders, footer ... all inside the image)
   const A = t.accent || "#A9752E";
   const head = FONT_MAP[t.font] || FONT_MAP.tajawal;
   const body = t.font === "amiri" ? FONT_MAP.tajawal : head;
@@ -574,7 +576,16 @@ function PrintSheet({ data, tpl, preview, title, docNo, docNoLabel = "رقم", d
     </div>
   );
   let header;
-  if (t.headerImage) {
+  if (full && (t.pageHeader || "compact") === "none") {
+    header = null;
+  } else if (full && (t.pageHeader || "compact") === "compact") {
+    header = (
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: `2px solid ${A}`, paddingBottom: 6 }}>
+        <div style={{ fontFamily: head, fontSize: 22, fontWeight: 700, color: A }}>{title}</div>
+        <div style={{ textAlign: "left", fontSize: 12.5 }}>{docNo !== undefined && docNo !== "" && <div style={{ fontWeight: 700 }}>{docNoLabel}: {docNo}</div>}{date && <div>التاريخ: {date}</div>}</div>
+      </div>
+    );
+  } else if (t.headerImage) {
     header = (
       <div>
         <img src={t.headerImage} alt="" style={{ width: "100%", display: "block" }} />
@@ -599,7 +610,7 @@ function PrintSheet({ data, tpl, preview, title, docNo, docNoLabel = "رقم", d
   } else {
     header = <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", paddingBottom: 10, borderBottom: `3px solid ${A}` }}>{shopInfo(false)}{titleBlock(false)}</div>;
   }
-  const frameStyle = t.frame === "single" ? { border: `1.5px solid ${A}`, padding: "7mm" } : t.frame === "double" ? { border: `4px double ${A}`, padding: "7mm" } : { padding: 0 };
+  const frameStyle = full ? { padding: 0 } : t.frame === "single" ? { border: `1.5px solid ${A}`, padding: "7mm" } : t.frame === "double" ? { border: `4px double ${A}`, padding: "7mm" } : { padding: 0 };
   const card = (c, i) => (
     <div key={i} style={{ border: `1px solid ${hexAlpha(A, "55")}`, borderTop: `3px solid ${A}`, borderRadius: 4, padding: "8px 10px", background: hexAlpha(A, "08") }}>
       <div style={{ fontWeight: 700, color: A, marginBottom: 5, fontSize: 13 }}>{c.title}</div>
@@ -608,7 +619,7 @@ function PrintSheet({ data, tpl, preview, title, docNo, docNoLabel = "رقم", d
     </div>
   );
   return (
-    <div className={preview ? "" : "printable"} style={{ width: preview ? "794px" : "210mm", minHeight: preview ? "1123px" : "297mm", background: "#fff", color: "#211D19", boxSizing: "border-box", padding: "10mm", margin: "0 auto", position: "relative", fontFamily: body, display: "flex", flexDirection: "column", boxShadow: preview ? "none" : "0 2px 10px rgba(0,0,0,.18)", overflow: "hidden" }}>
+    <div className={preview ? "" : "printable"} style={{ width: preview ? "794px" : "210mm", minHeight: preview ? "1123px" : "297mm", background: "#fff", color: "#211D19", boxSizing: "border-box", padding: full ? `${t.contentTop ?? 45}mm ${t.contentSide ?? 15}mm ${t.contentBottom ?? 30}mm` : "10mm", margin: "0 auto", position: "relative", fontFamily: body, display: "flex", flexDirection: "column", boxShadow: preview ? "none" : "0 2px 10px rgba(0,0,0,.18)", overflow: "hidden", ...(full ? { background: `#fff url(${t.pageImage}) top center / 100% ${preview ? "1123px" : "297mm"} repeat-y` } : {}) }}>
       {t.watermark && <div style={{ position: "absolute", top: "42%", left: 0, right: 0, textAlign: "center", fontSize: 96, fontWeight: 700, color: t.watermarkColor || A, opacity: t.watermarkOpacity || 0.06, transform: "rotate(-28deg)", pointerEvents: "none", fontFamily: head }}>{t.watermark}</div>}
       <div style={{ flex: 1, display: "flex", flexDirection: "column", ...frameStyle }}>
         {header}
@@ -643,12 +654,12 @@ function PrintSheet({ data, tpl, preview, title, docNo, docNoLabel = "رقم", d
             {signatures.map((sg) => <div key={sg} style={{ textAlign: "center" }}><div style={{ borderBottom: "1px solid #8A8071", height: 30, marginBottom: 5 }} />{sg}</div>)}
           </div>
         )}
-        <div style={{ marginTop: 18, borderTop: `1px solid ${hexAlpha(A, "66")}`, paddingTop: 7, fontSize: 10.5, color: "#7A7061", textAlign: "center" }}>
+        {(!full || t.pageShowFooter) && <div style={{ marginTop: 18, borderTop: `1px solid ${hexAlpha(A, "66")}`, paddingTop: 7, fontSize: 10.5, color: "#7A7061", textAlign: "center" }}>
           {showBank && sh.bankName && <div>تحويل بنكي: {sh.bankName}{sh.iban ? ` — آيبان: ${sh.iban}` : ""}</div>}
           {(t.footerText || footerNote) && <div style={{ fontSize: 11.5, color: "#5C5344", margin: "2px 0" }}>{t.footerText || footerNote}</div>}
           {t.footerImage && <img src={t.footerImage} alt="" style={{ width: "100%", display: "block", margin: "4px 0" }} />}
           <div>{[sh.website, `طُبع بتاريخ ${printedAt}`].filter(Boolean).join(" — ")}</div>
-        </div>
+        </div>}
       </div>
     </div>
   );
@@ -1014,6 +1025,24 @@ function PrintTemplatesPanel({ data, update }) {
                 <label style={{ display: "inline-flex", gap: 6, alignItems: "center" }}><input type="checkbox" checked={edit.showSignatures !== false} onChange={(e) => setEdit({ ...edit, showSignatures: e.target.checked })} />خانات التوقيع</label>
                 <label style={{ display: "inline-flex", gap: 6, alignItems: "center" }}><input type="checkbox" checked={!!edit.showQR} onChange={(e) => setEdit({ ...edit, showQR: e.target.checked })} />رمز QR تجريبي بالفاتورة</label>
               </div>
+              <div style={{ border: `2px dashed ${THEME.brass}`, borderRadius: 8, padding: 12, marginBottom: 14, background: `${THEME.brass}0d` }}>
+                <div style={{ fontWeight: 700, marginBottom: 4, fontSize: 14 }}>🖼 قالب جاهز كامل (صفحة A4 كاملة)</div>
+                <div style={{ fontSize: 12, color: "#7A7061", marginBottom: 8 }}>صمّم الصفحة كاملة بترويستها وإطارها وتذييلها وشعارها وبياناتك (من Canva أو Word أو Photoshop) وصدّرها <b>صورة عمودية بمقاس A4</b> (مثلًا 2480×3508 بكسل). ارفعها هنا فتُطبع خلفية لكل مستند، ويُوضع المحتوى داخل المنطقة التي تحددها بالهوامش أدناه.</div>
+                <input type="file" accept="image/*" onChange={pickImage("pageImage", 1754)} style={{ fontSize: 12 }} />
+                {edit.pageImage && (
+                  <div style={{ marginTop: 10 }}>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8 }}>
+                      <Field label="هامش أعلى (مم)"><TextInput type="number" value={edit.contentTop ?? 45} onChange={(e) => setEdit({ ...edit, contentTop: Number(e.target.value) })} /></Field>
+                      <Field label="هامش أسفل (مم)"><TextInput type="number" value={edit.contentBottom ?? 30} onChange={(e) => setEdit({ ...edit, contentBottom: Number(e.target.value) })} /></Field>
+                      <Field label="هامش جانبي (مم)"><TextInput type="number" value={edit.contentSide ?? 15} onChange={(e) => setEdit({ ...edit, contentSide: Number(e.target.value) })} /></Field>
+                    </div>
+                    <Field label="رأس المستند فوق المحتوى"><SelectInput options={[{ value: "compact", label: "مختصر (عنوان المستند ورقمه وتاريخه فقط)" }, { value: "none", label: "بدون رأس (تصميمي يحتوي كل شيء)" }, { value: "full", label: "كامل (بيانات المحل والشعار أيضًا)" }]} value={edit.pageHeader || "compact"} onChange={(e) => setEdit({ ...edit, pageHeader: e.target.value })} /></Field>
+                    <label style={{ display: "inline-flex", gap: 6, alignItems: "center", fontSize: 13.5, marginBottom: 8 }}><input type="checkbox" checked={!!edit.pageShowFooter} onChange={(e) => setEdit({ ...edit, pageShowFooter: e.target.checked })} />إظهار سطر التذييل (الآيبان وتاريخ الطباعة)</label>
+                    <div><Btn small variant="danger" onClick={() => setEdit({ ...edit, pageImage: "" })}>إزالة التصميم الكامل</Btn></div>
+                    <div style={{ fontSize: 11.5, color: "#8A8071", marginTop: 6 }}>المعاينة على اليسار تعكس الهوامش مباشرة. يناسب الفواتير والسندات؛ الكشوفات الطويلة (أكثر من صفحة) تُعاد فيها الخلفية لكن المحتوى قد يتداخل مع الترويسة في الصفحة الثانية، فاستخدم لها قالبًا عاديًا.</div>
+                  </div>
+                )}
+              </div>
               <div style={{ fontWeight: 700, marginBottom: 6, fontSize: 13.5 }}>تصميمك الخاص (اختياري)</div>
               <div style={{ fontSize: 12, color: "#7A7061", marginBottom: 8 }}>ارفع صورة ترويسة جاهزة صممتها (مثلًا بعرض 2100 بكسل وارتفاع 400) فتحل محل الترويسة المبنية. وكذلك صورة للتذييل.</div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
@@ -1041,7 +1070,9 @@ function PrintTemplatesPanel({ data, update }) {
 // ---------- Inventory (stock of fabrics, buttons, thread, lining ... per branch) ----------
 // Stock is DERIVED, never stored: purchases (+) − order consumption (−, cancelled orders excluded) ± manual adjustments.
 // So it can't drift or conflict between devices. Items are matched to purchases by name.
-const INV_CATEGORIES = ["قماش", "أزرار", "خيوط", "بطانة", "أخرى"];
+const DEFAULT_LISTS = { expenseCategories: ["إيجار", "رواتب", "فواتير خدمات", "صيانة", "أخرى"], incomeCategories: ["عربون", "دفعة على الحساب", "أخرى"], purchaseCategories: ["قماش", "أزرار", "خيوط", "بطانة", "أخرى"], inventoryCategories: ["قماش", "أزرار", "خيوط", "بطانة", "أخرى"] };
+const getList = (data, key) => (data.lists?.[key]?.length ? data.lists[key] : DEFAULT_LISTS[key]);
+const INV_CATEGORIES = DEFAULT_LISTS.inventoryCategories;
 const normName = (x) => String(x || "").trim().toLowerCase();
 function inventoryMovements(data) {
   const def = data.branches[0]?.id;
@@ -1103,9 +1134,10 @@ function InventoryView({ data, update, canEdit, currentUser }) {
     setItemModal(null);
   };
   const deleteItem = (it) => {
-    if (mv.some((m) => m.itemId === it.id) || (data.consumptionRules || []).some((r) => r.itemId === it.id)) { alert("لا يمكن حذف صنف له حركات أو قواعد استهلاك. اجعل حده الأدنى 0 بدل حذفه."); return; }
-    if (!window.confirm(`حذف الصنف «${it.name}»؟`)) return;
-    update({ inventoryItems: items.filter((i) => i.id !== it.id) });
+    const used = mv.some((m) => m.itemId === it.id) || (data.consumptionRules || []).some((r) => r.itemId === it.id);
+    if (used && !data._isAdmin) { alert("لا يمكن حذف صنف له حركات أو قواعد استهلاك. اجعل حده الأدنى 0 بدل حذفه."); return; }
+    if (!window.confirm(used ? `الصنف «${it.name}» له حركات أو قواعد استهلاك. حذفه يُسقط رصيده وقواعده من المخزون (تبقى المشتريات والطلبات كما هي). هل تحذفه نهائيًا؟` : `حذف الصنف «${it.name}»؟`)) return;
+    update({ inventoryItems: items.filter((i) => i.id !== it.id), consumptionRules: (data.consumptionRules || []).filter((r) => r.itemId !== it.id) });
   };
   const saveAdjustment = () => {
     const { item, values } = adjModal; const q = Number(values.qty);
@@ -1120,7 +1152,10 @@ function InventoryView({ data, update, canEdit, currentUser }) {
     else if (values.kind === "إضافة يدوية") adds = [{ ...base, id: uid("adj"), branch: values.branch, qty: q, kind: "إضافة يدوية" }];
     else if (values.kind === "نقل لفرع آخر") {
       if (!values.toBranch || values.toBranch === values.branch) { alert("اختر فرعًا مختلفًا للنقل"); return; }
-      if (q > now) { alert(`الكمية المتاحة في الفرع (${fmtNum(now)}) أقل من المطلوب نقلها`); return; }
+      if (q > now) {
+        if (!data._isAdmin) { alert(`الكمية المتاحة في الفرع (${fmtNum(now)}) أقل من المطلوب نقلها`); return; }
+        if (!window.confirm(`الكمية المتاحة في الفرع (${fmtNum(now)}) أقل من المطلوب نقلها (${fmtNum(q)}). سيصبح رصيد الفرع سالبًا. هل تتابع؟`)) return;
+      }
       const ref = `نقل من ${bName(values.branch)} إلى ${bName(values.toBranch)}`;
       adds = [{ ...base, id: uid("adj"), branch: values.branch, qty: -q, kind: "نقل صادر", reason: ref }, { ...base, id: uid("adj"), branch: values.toBranch, qty: q, kind: "نقل وارد", reason: ref }];
     }
@@ -1140,7 +1175,7 @@ function InventoryView({ data, update, canEdit, currentUser }) {
         <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
           {data.branches.length > 1 && <div style={{ width: 190 }}><SelectInput options={[{ value: "", label: "كل الفروع" }, ...data.branches.map((b) => ({ value: b.id, label: b.name }))]} value={branch} onChange={(e) => setBranch(e.target.value)} /></div>}
           <Btn variant="ghost" onClick={() => setRulesOpen(true)}>قواعد الاستهلاك التلقائي</Btn>
-          {canEdit && <Btn variant="brass" onClick={() => setItemModal({ mode: "add", values: { category: INV_CATEGORIES[0], minQty: 0 } })}><Plus size={16} />صنف جديد</Btn>}
+          {canEdit && <Btn variant="brass" onClick={() => setItemModal({ mode: "add", values: { category: getList(data, "inventoryCategories")[0], minQty: 0 } })}><Plus size={16} />صنف جديد</Btn>}
         </div>
       </div>
 
@@ -1188,7 +1223,7 @@ function InventoryView({ data, update, canEdit, currentUser }) {
         <Modal title={itemModal.mode === "add" ? "صنف جديد" : "تعديل الصنف"} onClose={() => setItemModal(null)}>
           <FormFields values={itemModal.values} setValues={(v) => setItemModal({ ...itemModal, values: v })} fields={[
             { key: "name", label: "اسم الصنف (نفس الاسم المستخدم في المشتريات والطلبات)" },
-            { key: "category", label: "التصنيف", type: "select", options: INV_CATEGORIES.map((c) => ({ value: c, label: c })) },
+            { key: "category", label: "التصنيف", type: "select", options: getList(data, "inventoryCategories").map((c) => ({ value: c, label: c })) },
             { key: "unit", label: "الوحدة (متر، قطعة، بكرة…)" },
             { key: "minQty", label: "الحد الأدنى للتنبيه", type: "number" },
           ]} />
@@ -1354,6 +1389,31 @@ function AdminDeleteModal({ title, lines, numberLabel, number, onConfirm, onClos
 }
 const withFreed = (data, key, no, free) => (free && no ? { freedNumbers: { ...(data.freedNumbers || {}), [key]: [...new Set([...((data.freedNumbers || {})[key] || []), Number(no)])].sort((a, b) => a - b) } } : {});
 
+function ListsPanel({ data, update }) {
+  const defs = [["expenseCategories", "فئات المصروفات (سندات الصرف)"], ["incomeCategories", "فئات الإيرادات (سندات القبض)"], ["purchaseCategories", "فئات المشتريات"], ["inventoryCategories", "تصنيفات المخزون"]];
+  const [draft, setDraft] = useState({});
+  const set = (k, arr) => update({ lists: { ...(data.lists || {}), [k]: arr } });
+  return (
+    <Panel style={{ marginTop: 20 }}>
+      <div style={{ fontWeight: 700, fontSize: 16, marginBottom: 4 }}>القوائم القابلة للتخصيص (مدير النظام)</div>
+      <div style={{ fontSize: 12.5, color: "#7A7061", marginBottom: 12 }}>أضف أو احذف أي بند. حذف بند لا يغيّر السندات أو المشتريات المسجَّلة به سابقًا.</div>
+      {defs.map(([k, label]) => (
+        <div key={k} style={{ marginBottom: 14 }}>
+          <div style={{ fontWeight: 600, fontSize: 13.5, marginBottom: 6 }}>{label}</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: 6 }}>
+            {getList(data, k).map((c) => <span key={c} style={{ background: `${THEME.teal}18`, border: `1px solid ${THEME.teal}`, borderRadius: 14, padding: "2px 10px", fontSize: 13 }}>{c} <span style={{ cursor: "pointer", color: THEME.red, marginRight: 4 }} onClick={() => set(k, getList(data, k).filter((x) => x !== c))}>×</span></span>)}
+          </div>
+          <div style={{ display: "flex", gap: 6, maxWidth: 320 }}>
+            <TextInput placeholder="بند جديد" value={draft[k] || ""} onChange={(e) => setDraft({ ...draft, [k]: e.target.value })} />
+            <Btn small variant="brass" onClick={() => { const v = (draft[k] || "").trim(); if (!v || getList(data, k).includes(v)) return; set(k, [...getList(data, k), v]); setDraft({ ...draft, [k]: "" }); }}><Plus size={14} /></Btn>
+          </div>
+        </div>
+      ))}
+      {(data.lists && Object.keys(data.lists).length > 0) && <Btn small variant="ghost" onClick={() => { if (window.confirm("إعادة كل القوائم إلى الافتراضي؟")) update({ lists: {} }); }}>إعادة الافتراضي</Btn>}
+    </Panel>
+  );
+}
+
 function FreedNumbersPanel({ data, update }) {
   const labels = { order: "أرقام الطلبات / الفواتير", group: "أرقام الطلبيات", voucher: "أرقام السندات", purchase: "أرقام المشتريات", customer: "أكواد العملاء" };
   const fn = data.freedNumbers || {};
@@ -1366,6 +1426,472 @@ function FreedNumbersPanel({ data, update }) {
         <div key={k} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", borderBottom: `1px dashed ${THEME.border}`, fontSize: 13.5 }}>
           <span><b>{labels[k]}:</b> {(fn[k] || []).join("، ")}</span>
           <Btn small variant="danger" onClick={() => update({ freedNumbers: { ...fn, [k]: [] } })}>مسح (لا تُستخدم مجددًا)</Btn>
+        </div>
+      ))}
+    </Panel>
+  );
+}
+
+// ---------- Returns & amendments ----------
+// A return refunds money (a numbered payment voucher + the order's paid amount goes down); an amendment redoes work.
+// Either can charge the responsible employee and/or cancel the earnings they got for the order.
+function buildReturnPatch(data, order, v, currentUser) {
+  const isRefund = v.kind === "مرتجع واسترداد";
+  const amt = isRefund ? Number(v.amount) || 0 : 0;
+  const ded = Number(v.deduction) || 0;
+  const paid = Number(order.deposit) || 0;
+    const no = order.orderNo || order.id.slice(-6);
+    let counters = data.counters, freedNumbers = data.freedNumbers;
+    const tr = issueNumber(data, counters, "return", 1000, (data.returns || []).map((r) => r.returnNo)); counters = tr.counters; freedNumbers = tr.freedNumbers;
+    let vouchers = data.vouchers, financeAccounts = data.financeAccounts, voucherId = "";
+    if (isRefund && amt > 0) {
+      const bv = buildVoucher(counters, { type: "صرف", accountId: v.accountId, branch: order.branch, category: "مرتجع عميل", amount: amt, description: `مرتجع طلب #${no} — ${v.reason}`, date: v.date, orderId: order.id, partyType: "عميل", partyId: order.customerId }, currentUser, { ...data, freedNumbers });
+      counters = bv.counters; freedNumbers = bv.freedNumbers; voucherId = bv.voucher.id;
+      vouchers = [...data.vouchers, bv.voucher];
+      financeAccounts = data.financeAccounts.map((a) => a.id === v.accountId ? { ...a, balance: round2((Number(a.balance) || 0) - amt) } : a);
+    }
+    let employeeLedger = data.employeeLedger || [];
+    if (v.dropEarnings) employeeLedger = employeeLedger.filter((l) => !(l.auto && l.orderId === order.id));
+    if (ded > 0) {
+      const te = nextCounter(counters, "empEntry", 5000); counters = te.counters;
+      employeeLedger = [...employeeLedger, { id: uid("el"), entryNo: te.no, employeeId: v.employeeId, date: v.date, createdAt: new Date().toISOString(), kind: "خصم", desc: `خصم بسبب ${v.kind} — طلب #${no}: ${v.reason}`, credit: 0, debit: ded, orderId: order.id, by: currentUser }];
+    }
+    const stageLog = v.redoStage ? [...(order.stageLog || []), { stage: v.redoStage, at: new Date().toLocaleString("ar-SA"), ts: new Date().toISOString(), note: `إعادة للتعديل — ${v.reason}` }] : order.stageLog;
+    const orders = data.orders.map((o) => o.id === order.id ? { ...o, deposit: isRefund ? Math.max(0, paid - amt) : o.deposit, returnedAmount: round2((Number(o.returnedAmount) || 0) + amt), ...(v.redoStage ? { stage: v.redoStage, stageLog } : {}) } : o);
+    const rec = { id: uid("ret"), returnNo: tr.no, orderId: order.id, orderNo: no, customerId: order.customerId, branch: order.branch, date: v.date, kind: v.kind, reason: v.reason.trim(), amount: amt, voucherId, employeeId: v.employeeId || "", deduction: ded, droppedEarnings: !!v.dropEarnings, redoStage: v.redoStage || "", createdBy: currentUser, createdAt: new Date().toISOString() };
+    const auditLog = [...(data.auditLog || []), logEntry(currentUser, v.kind, `طلب #${no} — ${v.reason}${amt ? ` — استرداد ${fmtNum(amt)} ر.س` : ""}${ded ? ` — خصم ${fmtNum(ded)} من الموظف` : ""}`)];
+    return { patch: { returns: [...(data.returns || []), rec], orders, vouchers, financeAccounts, employeeLedger, counters, freedNumbers, auditLog }, rec };
+}
+
+function ReturnModal({ data, update, order, currentUser, onClose }) {
+  const cust = data.customers.find((c) => c.id === order.customerId);
+  const paid = Number(order.deposit) || 0;
+  const tailorId = order.stageAssignments?.["الخياطة"] || order.assignedTailorId || "";
+  const [v, setV] = useState({ kind: "مرتجع واسترداد", amount: paid, accountId: data.financeAccounts[0]?.id, reason: "", employeeId: tailorId, deduction: "", dropEarnings: false, redoStage: "", date: todayStr() });
+  const isRefund = v.kind === "مرتجع واسترداد";
+  const save = () => {
+    const amt = isRefund ? Number(v.amount) || 0 : 0;
+    if (!String(v.reason || "").trim()) { alert("اكتب سبب المرتجع / التعديل"); return; }
+    if (!periodAllowed(data, v.date, "تسجيل مرتجع بهذا التاريخ")) return;
+    if (isRefund && amt > paid) {
+      if (!data._isAdmin) { alert(`المبلغ المسترد (${fmtNum(amt)}) أكبر من المدفوع على الطلب (${fmtNum(paid)})`); return; }
+      if (!window.confirm(`المبلغ المسترد (${fmtNum(amt)}) أكبر من المدفوع على الطلب (${fmtNum(paid)}). كمدير للنظام يمكنك المتابعة. هل تتابع؟`)) return;
+    }
+    if (isRefund && amt > 0 && !v.accountId) { alert("اختر الحساب الذي يُصرف منه المبلغ"); return; }
+    const ded = Number(v.deduction) || 0;
+    if (ded > 0 && !v.employeeId) { alert("اختر الموظف المراد الخصم منه"); return; }
+    if (!isRefund && !v.redoStage && !ded && !v.dropEarnings) { if (!window.confirm("لم تحدد إعادة مرحلة ولا خصمًا. سيُسجَّل التعديل للمتابعة فقط. متابعة؟")) return; }
+    const { patch, rec } = buildReturnPatch(data, order, v, currentUser);
+    update(patch);
+    onClose(rec);
+  };
+  return (
+    <Modal title={`مرتجع / تعديل — طلب #${order.orderNo || ""}`} onClose={() => onClose(null)}>
+      <div style={{ fontSize: 13, marginBottom: 10 }}>العميل: <b>{cust?.name || "—"}</b> — المدفوع على الطلب: <b>{fmtNum(paid)} ر.س</b></div>
+      <Field label="النوع"><SelectInput options={[{ value: "مرتجع واسترداد", label: "مرتجع واسترداد مبلغ" }, { value: "تعديل / إعادة تفصيل", label: "تعديل / إعادة تفصيل (بدون استرداد)" }]} value={v.kind} onChange={(e) => setV({ ...v, kind: e.target.value })} /></Field>
+      {isRefund && (
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+          <Field label="المبلغ المسترد (ر.س)"><TextInput type="number" value={v.amount} onChange={(e) => setV({ ...v, amount: e.target.value })} /></Field>
+          <Field label="يُصرف من حساب"><SelectInput options={data.financeAccounts.map((a) => ({ value: a.id, label: a.name }))} value={v.accountId} onChange={(e) => setV({ ...v, accountId: e.target.value })} /></Field>
+        </div>
+      )}
+      <Field label="السبب (إلزامي)"><TextInput value={v.reason} onChange={(e) => setV({ ...v, reason: e.target.value })} placeholder="مثال: مقاس خاطئ، عيب في الخياطة" /></Field>
+      <Field label="إعادة الطلب إلى مرحلة (اختياري)"><SelectInput options={[{ value: "", label: "بدون" }, ...data.orderStages.slice(0, -1).map((s) => ({ value: s, label: s }))]} value={v.redoStage} onChange={(e) => setV({ ...v, redoStage: e.target.value })} /></Field>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+        <Field label="الموظف المسؤول (اختياري)"><SelectInput options={[{ value: "", label: "— لا أحد —" }, ...data.employees.map((e) => ({ value: e.id, label: `${e.name} (${e.role})` }))]} value={v.employeeId} onChange={(e) => setV({ ...v, employeeId: e.target.value })} /></Field>
+        <Field label="خصم من الموظف (ر.س)"><TextInput type="number" value={v.deduction} onChange={(e) => setV({ ...v, deduction: e.target.value })} /></Field>
+      </div>
+      <label style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 13.5, marginBottom: 12 }}><input type="checkbox" checked={v.dropEarnings} onChange={(e) => setV({ ...v, dropEarnings: e.target.checked })} />إلغاء أجر القطعة والنسبة التي احتُسبت للموظفين على هذا الطلب</label>
+      <div style={{ display: "flex", gap: 8 }}><Btn variant="brass" onClick={save}>حفظ{isRefund ? " وإصدار سند الصرف" : ""}</Btn><Btn variant="ghost" onClick={() => onClose(null)}>إلغاء</Btn></div>
+    </Modal>
+  );
+}
+
+function ReturnsView({ data, update, canEdit, currentUser }) {
+  const [pick, setPick] = useState(null);
+  const [orderId, setOrderId] = useState("");
+  const [printing, setPrinting] = useState(null);
+  const custName = (id) => data.customers.find((c) => c.id === id)?.name || "—";
+  const rows = [...(data.returns || [])].sort((a, b) => (b.returnNo || 0) - (a.returnNo || 0));
+  const pickable = data.orders.filter((o) => !o.cancelled);
+  const th = { padding: "8px 10px", textAlign: "right" };
+  const totalRefund = rows.reduce((t, r) => t + (Number(r.amount) || 0), 0);
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 14 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}><RotateCcw size={22} color={THEME.brass} /><h2 style={{ margin: 0, fontFamily: "Amiri, serif", fontSize: 26 }}>المرتجعات والتعديلات</h2></div>
+        {canEdit && (
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <div style={{ width: 280 }}><SelectInput options={[{ value: "", label: "— اختر الطلب —" }, ...pickable.map((o) => ({ value: o.id, label: `#${o.orderNo} — ${custName(o.customerId)}` }))]} value={orderId} onChange={(e) => setOrderId(e.target.value)} /></div>
+            <Btn variant="brass" onClick={() => { const o = data.orders.find((x) => x.id === orderId); if (!o) { alert("اختر الطلب أولًا"); return; } setPick(o); }}><Plus size={16} />مرتجع / تعديل جديد</Btn>
+          </div>
+        )}
+      </div>
+      <Panel>
+        {rows.length === 0 ? <EmptyState text="لا توجد مرتجعات أو تعديلات مسجَّلة" /> : (
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13.5 }}>
+              <thead><tr style={{ background: "#EFE7D6" }}><th style={th}>الرقم</th><th style={th}>التاريخ</th><th style={th}>الطلب</th><th style={th}>العميل</th><th style={th}>النوع</th><th style={th}>السبب</th><th style={th}>المسترد</th><th style={th}>الموظف / الخصم</th><th style={th}></th></tr></thead>
+              <tbody>
+                {rows.map((r) => (
+                  <tr key={r.id} style={{ borderTop: `1px solid ${THEME.border}` }}>
+                    <td style={{ padding: "8px 10px", fontWeight: 700, color: THEME.brass }}>{r.returnNo}</td>
+                    <td style={{ padding: "8px 10px" }}>{r.date}</td>
+                    <td style={{ padding: "8px 10px" }}>#{r.orderNo}</td>
+                    <td style={{ padding: "8px 10px" }}>{custName(r.customerId)}</td>
+                    <td style={{ padding: "8px 10px" }}><Badge color={r.amount ? THEME.red : THEME.teal}>{r.kind}</Badge>{r.redoStage && <div style={{ fontSize: 11.5, color: "#8A8071" }}>أُعيد إلى: {r.redoStage}</div>}</td>
+                    <td style={{ padding: "8px 10px" }}>{r.reason}</td>
+                    <td style={{ padding: "8px 10px", fontWeight: 700 }}>{r.amount ? `${fmtNum(r.amount)} ر.س` : "—"}</td>
+                    <td style={{ padding: "8px 10px", fontSize: 12.5 }}>{r.employeeId ? (data.employees.find((e) => e.id === r.employeeId)?.name || "—") : "—"}{r.deduction ? ` — خصم ${fmtNum(r.deduction)}` : ""}{r.droppedEarnings ? " — أُلغيت أجوره" : ""}</td>
+                    <td style={{ padding: "8px 10px" }}><Btn small variant="ghost" onClick={() => setPrinting(r)}><Printer size={13} /></Btn></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Panel>
+      {rows.length > 0 && <div style={{ marginTop: 10, fontSize: 13, color: "#7A7061" }}>إجمالي المسترد: <b>{fmtNum(totalRefund)} ر.س</b> في {rows.length} سجل</div>}
+      <div style={{ fontSize: 12, color: "#8A8071", marginTop: 8 }}>يمكنك أيضًا فتح المرتجع من تفاصيل أي طلب. المبلغ المسترد يُصدر له سند صرف مرقَّم ويُنقص المدفوع من الطلب ويظهر في كشف العميل.</div>
+      {pick && <ReturnModal data={data} update={update} order={pick} currentUser={currentUser} onClose={() => { setPick(null); setOrderId(""); }} />}
+      {printing && (
+        <RecordPrintModal data={data} docType="voucher" title={printing.amount ? "إشعار مرتجع" : "طلب تعديل"} refLabel="مرتجع" refNo={printing.returnNo} date={printing.date} amount={printing.amount || undefined}
+          onClose={() => setPrinting(null)} signatures={["توقيع العميل", "المحاسب / المسؤول"]}
+          partyTitle="بيانات العميل" partyRows={[{ label: "الاسم", value: custName(printing.customerId) }, ...(data.customers.find((c) => c.id === printing.customerId)?.phone ? [{ label: "الجوال", value: data.customers.find((c) => c.id === printing.customerId).phone }] : [])]}
+          rows={[{ label: "الطلب", value: `#${printing.orderNo}` }, { label: "النوع", value: printing.kind }, { label: "الفرع", value: data.branches.find((b) => b.id === printing.branch)?.name || "—" }, { label: "السبب", value: printing.reason }, ...(printing.redoStage ? [{ label: "أُعيد إلى مرحلة", value: printing.redoStage }] : [])]} />
+      )}
+    </div>
+  );
+}
+
+// ---------- Employee performance ----------
+// Pieces and earnings come from the employee ledger (credited when the courier hands a piece over);
+// rework comes from returns/amendments; speed is measured from hand-over to receipt (recorded from this version on).
+function employeePerformance(data, { from, to, branch }) {
+  const inRange = (d) => (!from || (d || "") >= from) && (!to || (d || "") <= to);
+  const def = data.branches[0]?.id;
+  const orderById = new Map(data.orders.map((o) => [o.id, o]));
+  return data.employees.filter((e) => !branch || empBranches(data, e).includes(branch)).map((e) => {
+    const earn = (data.employeeLedger || []).filter((l) => {
+      const o = orderById.get(l.orderId);
+      return l.employeeId === e.id && l.auto && (l.kind === "قطعة" || l.kind === "نسبة") && o && !o.cancelled && inRange(l.date) && (!branch || (o.branch || def) === branch);
+    });
+    const pieceKeys = new Set(earn.map((l) => `${l.orderId}|${l.stage}`));
+    const orderIds = new Set(earn.map((l) => l.orderId));
+    const value = round2([...orderIds].reduce((t, id) => { const o = orderById.get(id); return t + Math.max(0, (Number(o.price) || 0) - (Number(o.discount) || 0)); }, 0));
+    const wages = round2(earn.reduce((t, l) => t + (Number(l.credit) || 0), 0));
+    const returns = (data.returns || []).filter((r) => r.employeeId === e.id && inRange(r.date) && (!branch || (r.branch || def) === branch));
+    const deductions = round2((data.employeeLedger || []).filter((l) => l.employeeId === e.id && l.kind === "خصم" && inRange(l.date)).reduce((t, l) => t + (Number(l.debit) || 0), 0));
+    const durs = [];
+    data.orders.forEach((o) => {
+      if (o.cancelled || (branch && (o.branch || def) !== branch)) return;
+      const log = o.stageLog || [];
+      log.forEach((en, i) => {
+        if (!en.ts || !String(en.note || "").startsWith("تسليم إلى") || !String(en.note).endsWith(`— ${e.name}`) || !inRange(String(en.ts).slice(0, 10))) return;
+        const rec = log.slice(i + 1).find((x) => x.ts && String(x.note || "").startsWith(`استلام من ${en.stage}`));
+        if (rec) { const h = (new Date(rec.ts) - new Date(en.ts)) / 3600000; if (h >= 0) durs.push(h); }
+      });
+    });
+    const avgHours = durs.length ? round2(durs.reduce((a, b) => a + b, 0) / durs.length) : null;
+    const pieces = pieceKeys.size;
+    return { emp: e, pieces, value, wages, returns, deductions, avgHours, timed: durs.length, reworkRate: pieces ? round2(returns.length / pieces * 100) : 0, earn };
+  });
+}
+const fmtHours = (h) => h === null ? "—" : h >= 48 ? `${fmtNum(h / 24)} يوم` : `${fmtNum(h)} ساعة`;
+
+function EmployeePerformance({ data }) {
+  const now = new Date();
+  const [from, setFrom] = useState(`${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-01`);
+  const [to, setTo] = useState(todayStr());
+  const [branch, setBranch] = useState("");
+  const [sort, setSort] = useState("pieces");
+  const [detail, setDetail] = useState(null);
+  const [printing, setPrinting] = useState(false);
+  const [tplId, setTplId] = useState(null);
+  const rows = employeePerformance(data, { from, to, branch }).filter((r) => r.pieces || r.returns.length || r.deductions || r.wages)
+    .sort((a, b) => sort === "rework" ? b.reworkRate - a.reworkRate : sort === "speed" ? (a.avgHours ?? 1e9) - (b.avgHours ?? 1e9) : sort === "value" ? b.value - a.value : b.pieces - a.pieces);
+  const maxPieces = Math.max(1, ...rows.map((r) => r.pieces));
+  const th = { padding: "8px 10px", textAlign: "right" };
+  const tpl = resolveTpl(data, "statement", tplId);
+  const periodText = `${from || "…"} إلى ${to || "…"}${branch ? ` — ${data.branches.find((b) => b.id === branch)?.name}` : ""}`;
+  return (
+    <Panel style={{ marginTop: 16 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
+        <div style={{ fontWeight: 700, fontSize: 16 }}>أداء الموظفين</div>
+        <Btn small variant="ghost" onClick={() => setPrinting(true)}><Printer size={13} />طباعة التقرير</Btn>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: 8, marginBottom: 6 }}>
+        <Field label="من"><TextInput type="date" value={from} onChange={(e) => setFrom(e.target.value)} /></Field>
+        <Field label="إلى"><TextInput type="date" value={to} onChange={(e) => setTo(e.target.value)} /></Field>
+        {data.branches.length > 1 && <Field label="الفرع"><SelectInput options={[{ value: "", label: "كل الفروع" }, ...data.branches.map((b) => ({ value: b.id, label: b.name }))]} value={branch} onChange={(e) => setBranch(e.target.value)} /></Field>}
+        <Field label="الترتيب حسب"><SelectInput options={[{ value: "pieces", label: "عدد القطع" }, { value: "value", label: "قيمة الطلبات" }, { value: "speed", label: "الأسرع إنجازًا" }, { value: "rework", label: "الأكثر إعادة" }]} value={sort} onChange={(e) => setSort(e.target.value)} /></Field>
+      </div>
+      {rows.length === 0 ? <EmptyState text="لا توجد بيانات أداء في هذه الفترة" /> : (
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13.5 }}>
+            <thead><tr style={{ background: "#EFE7D6" }}><th style={th}>الموظف</th><th style={th}>القطع</th><th style={th}>قيمة الطلبات</th><th style={th}>أجور القطع والنسب</th><th style={th}>متوسط زمن الإنجاز</th><th style={th}>إعادات</th><th style={th}>خصومات</th><th style={th}></th></tr></thead>
+            <tbody>
+              {rows.map((r) => (
+                <tr key={r.emp.id} style={{ borderTop: `1px solid ${THEME.border}` }}>
+                  <td style={{ padding: "8px 10px", fontWeight: 600 }}>{r.emp.name}<div style={{ fontSize: 11.5, color: "#8A8071", fontWeight: 400 }}>{r.emp.role}</div></td>
+                  <td style={{ padding: "8px 10px", minWidth: 120 }}><b>{r.pieces}</b><div style={{ height: 5, background: "#EFE7D6", borderRadius: 3, marginTop: 3 }}><div style={{ width: `${r.pieces / maxPieces * 100}%`, height: 5, background: THEME.brass, borderRadius: 3 }} /></div></td>
+                  <td style={{ padding: "8px 10px" }}>{fmtNum(r.value)}</td>
+                  <td style={{ padding: "8px 10px" }}>{fmtNum(r.wages)}</td>
+                  <td style={{ padding: "8px 10px" }}>{fmtHours(r.avgHours)}{r.timed > 0 && <div style={{ fontSize: 11, color: "#8A8071" }}>من {r.timed} قياس</div>}</td>
+                  <td style={{ padding: "8px 10px", color: r.reworkRate > 10 ? THEME.red : "inherit", fontWeight: r.returns.length ? 700 : 400 }}>{r.returns.length}{r.pieces ? ` (${fmtNum(r.reworkRate)}%)` : ""}</td>
+                  <td style={{ padding: "8px 10px" }}>{r.deductions ? fmtNum(r.deductions) : "—"}</td>
+                  <td style={{ padding: "8px 10px" }}><Btn small variant="ghost" onClick={() => setDetail(r)}>تفاصيل</Btn></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      <div style={{ fontSize: 11.5, color: "#8A8071", marginTop: 8 }}>القطع = ما سلّمه المراسل للموظف في الفترة (قطعة لكل طلب ومرحلة). الإعادات من «المرتجعات والتعديلات» المسجَّلة عليه. زمن الإنجاز = من التسليم للموظف حتى الاستلام منه، ويُقاس للتسليمات الجديدة فقط.</div>
+
+      {detail && (
+        <Modal title={`تفاصيل أداء — ${detail.emp.name}`} onClose={() => setDetail(null)} wide>
+          <div style={{ fontWeight: 700, marginBottom: 6 }}>القطع المستلمة ({detail.pieces})</div>
+          {detail.earn.length === 0 ? <EmptyState text="لا قطع" /> : (
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+              <thead><tr style={{ background: "#EFE7D6" }}><th style={th}>التاريخ</th><th style={th}>الطلب</th><th style={th}>المرحلة</th><th style={th}>النوع</th><th style={th}>المبلغ</th></tr></thead>
+              <tbody>{detail.earn.map((l) => <tr key={l.id} style={{ borderTop: `1px solid ${THEME.border}` }}><td style={{ padding: "6px 10px" }}>{l.date}</td><td style={{ padding: "6px 10px" }}>{data.orders.find((o) => o.id === l.orderId)?.orderNo ? `#${data.orders.find((o) => o.id === l.orderId).orderNo}` : "—"}</td><td style={{ padding: "6px 10px" }}>{l.stage}</td><td style={{ padding: "6px 10px" }}>{l.kind}</td><td style={{ padding: "6px 10px" }}>{fmtNum(l.credit)}</td></tr>)}</tbody>
+            </table>
+          )}
+          {detail.returns.length > 0 && (
+            <>
+              <div style={{ fontWeight: 700, margin: "14px 0 6px", color: THEME.red }}>الإعادات والمرتجعات ({detail.returns.length})</div>
+              {detail.returns.map((r) => <div key={r.id} style={{ fontSize: 13, padding: "5px 0", borderBottom: `1px dashed ${THEME.border}` }}>#{r.returnNo} — طلب #{r.orderNo} — {r.kind} — {r.reason}{r.deduction ? ` — خصم ${fmtNum(r.deduction)}` : ""}</div>)}
+            </>
+          )}
+        </Modal>
+      )}
+
+      {printing && (
+        <Modal title="طباعة تقرير الأداء" onClose={() => setPrinting(false)} width={900}>
+          <PrintStage data={data} docType="statement" tplId={tplId} setTplId={setTplId}>
+            <PrintSheet data={data} tpl={tpl} title="تقرير أداء الموظفين" date={todayStr()} meta={[{ label: "الفترة", value: periodText }, { label: "عدد الموظفين", value: rows.length }, { label: "إجمالي القطع", value: rows.reduce((t, r) => t + r.pieces, 0) }]} signatures={["المدير", "المراجع"]}>
+              <PTable tpl={tpl} columns={[{ key: "n", label: "الموظف" }, { key: "p", label: "القطع", align: "center" }, { key: "v", label: "قيمة الطلبات", align: "center" }, { key: "w", label: "أجور القطع والنسب", align: "center" }, { key: "t", label: "متوسط الزمن", align: "center" }, { key: "r", label: "إعادات", align: "center" }, { key: "d", label: "خصومات", align: "center" }]}
+                rows={rows.map((r) => ({ key: r.emp.id, n: `${r.emp.name} (${r.emp.role})`, p: r.pieces, v: fmtNum(r.value), w: fmtNum(r.wages), t: fmtHours(r.avgHours), r: `${r.returns.length}${r.pieces ? ` (${fmtNum(r.reworkRate)}%)` : ""}`, d: r.deductions ? fmtNum(r.deductions) : "—" }))} />
+            </PrintSheet>
+          </PrintStage>
+        </Modal>
+      )}
+    </Panel>
+  );
+}
+
+// ---------- Branch profit & loss ----------
+function branchPnL(data, month, branchId) {
+  const def = data.branches[0]?.id;
+  const inMonth = (d) => String(d || "").slice(0, 7) === month;
+  const sum = (arr, f) => round2(arr.reduce((t, x) => t + (Number(f(x)) || 0), 0));
+  const group = (arr, keyF, valF) => { const m = {}; arr.forEach((x) => { const k = keyF(x) || "أخرى"; m[k] = round2((m[k] || 0) + (Number(valF(x)) || 0)); }); return m; };
+  const orders = data.orders.filter((o) => !o.cancelled && (o.branch || def) === branchId && inMonth(o.createdAt));
+  const revenue = sum(orders, (o) => Math.max(0, (Number(o.price) || 0) - (Number(o.discount) || 0)));
+  const outV = liveVouchers(data).filter((v) => v.type === "صرف" && (v.branch || def) === branchId && inMonth(v.date));
+  const refunds = sum(outV.filter((v) => v.category === "مرتجع عميل"), (v) => v.amount);
+  const expList = outV.filter((v) => !v.employeeId && !v.supplierId && v.category !== "مرتجع عميل");
+  const expenses = sum(expList, (v) => v.amount); const expensesByCat = group(expList, (v) => v.category, (v) => v.amount);
+  const purList = (data.purchases || []).filter((x) => (x.branch || def) === branchId && inMonth(x.date));
+  const purchases = sum(purList, (x) => x.cost); const purchasesByCat = group(purList, (x) => x.category, (x) => x.cost);
+  const weightOf = (l) => {
+    const emp = data.employees.find((e) => e.id === l.employeeId);
+    const ord = l.orderId ? data.orders.find((o) => o.id === l.orderId) : null;
+    return ord ? ((ord.branch || def) === branchId ? 1 : 0) : (emp ? empBranchWeight(data, emp, branchId) : (def === branchId ? 1 : 0));
+  };
+  const ledger = data.employeeLedger || [];
+  const wages = round2(ledger.filter((l) => ["راتب", "قطعة", "نسبة", "مكافأة"].includes(l.kind) && (l.month ? l.month === month : inMonth(l.date))).reduce((t, l) => t + (Number(l.credit) || 0) * weightOf(l), 0));
+  const shares = round2(ledger.filter((l) => l.kind === "أرباح" && l.month === month && (!l.branchId || l.branchId === branchId)).reduce((t, l) => t + (Number(l.credit) || 0), 0));
+  const profit = round2(revenue - refunds - purchases - expenses - wages);
+  return { revenue, refunds, purchases, purchasesByCat, expenses, expensesByCat, wages, profit, shares, net: round2(profit - shares), orders: orders.length };
+}
+function sumPnL(list) {
+  const out = { revenue: 0, refunds: 0, purchases: 0, expenses: 0, wages: 0, profit: 0, shares: 0, net: 0, orders: 0, purchasesByCat: {}, expensesByCat: {} };
+  list.forEach((p) => {
+    ["revenue", "refunds", "purchases", "expenses", "wages", "profit", "shares", "net", "orders"].forEach((k) => { out[k] = round2(out[k] + p[k]); });
+    ["purchasesByCat", "expensesByCat"].forEach((k) => Object.keys(p[k]).forEach((c) => { out[k][c] = round2((out[k][c] || 0) + p[k][c]); }));
+  });
+  return out;
+}
+function PnLReport({ data, initialMode }) {
+  const isAdmin = !!data._isAdmin;   // only the system admin sees the consolidated total of all branches
+  const now = new Date(); const ym = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+  const [mode, setMode] = useState(initialMode || "branches");
+  const [month, setMonth] = useState(ym(now));
+  const [fromM, setFromM] = useState(ym(new Date(now.getFullYear(), now.getMonth() - 5, 1)));
+  const [toM, setToM] = useState(ym(now));
+  const [branch, setBranch] = useState(isAdmin ? "" : (data.branches[0]?.id || ""));
+  const [metric, setMetric] = useState("profit");
+  const [printing, setPrinting] = useState(false);
+  const [tplId, setTplId] = useState(null);
+  const tpl = resolveTpl(data, "statement", tplId);
+  const monthsBetween = (a, b) => { const out = []; let [y, m] = a.split("-").map(Number); const [y2, m2] = b.split("-").map(Number); let guard = 0; while ((y < y2 || (y === y2 && m <= m2)) && guard++ < 36) { out.push(`${y}-${String(m).padStart(2, "0")}`); m += 1; if (m > 12) { m = 1; y += 1; } } return out; };
+  const mLabel = (m) => new Date(`${m}-01`).toLocaleDateString("ar-SA", { month: "short", year: "2-digit" });
+  const bName = (id) => data.branches.find((b) => b.id === id)?.name || "—";
+  const metrics = { profit: ["صافي الربح", (p) => p.profit], revenue: ["الإيرادات", (p) => p.revenue], net: ["الصافي بعد حصص الموظفين", (p) => p.net] };
+  const months = monthsBetween(fromM, toM);
+  const effBranch = branch || (isAdmin ? "" : data.branches[0]?.id);
+  const branchIds = effBranch ? [effBranch] : data.branches.map((b) => b.id);
+
+  let head = [], tableRows = [], chartData = [];
+  const money = (v) => fmtNum(v);
+  if (mode === "matrix") {
+    // every branch on its own line, month by month — the branch comparison
+    const [mlabel, mget] = metrics[metric];
+    const perBranch = data.branches.map((b) => ({ b, vals: months.map((m) => mget(branchPnL(data, m, b.id))) }));
+    head = ["الفرع", ...months.map(mLabel), "المجموع"];
+    const best = months.map((_, j) => Math.max(...perBranch.map((x) => x.vals[j])));
+    tableRows = perBranch.map((x) => ({ label: x.b.name, cells: [...x.vals.map((v) => money(v)), money(x.vals.reduce((a, c) => a + c, 0))], nums: x.vals, best: x.vals.map((v, j) => data.branches.length > 1 && v === best[j] && v > 0) }));
+    if (isAdmin && data.branches.length > 1) { const tot = months.map((_, j) => round2(perBranch.reduce((t, x) => t + x.vals[j], 0))); tableRows.push({ label: `إجمالي الفروع (${mlabel})`, cells: [...tot.map(money), money(tot.reduce((a, c) => a + c, 0))], nums: tot, strong: true }); }
+    chartData = months.map((m, j) => { const o = { name: mLabel(m) }; perBranch.forEach((x) => { o[x.b.name] = x.vals[j]; }); return o; });
+  } else {
+    let cols;
+    if (mode === "branches") {
+      cols = data.branches.map((b) => ({ label: b.name, p: branchPnL(data, month, b.id) }));
+      if (isAdmin && cols.length > 1) cols.push({ label: "إجمالي الفروع", p: sumPnL(cols.map((c) => c.p)), total: true });
+    } else {
+      cols = months.map((m) => ({ label: mLabel(m), p: sumPnL(branchIds.map((id) => branchPnL(data, m, id))) }));
+      if (cols.length > 1) cols.push({ label: "الإجمالي", p: sumPnL(cols.map((c) => c.p)), total: true });
+      chartData = cols.filter((c) => !c.total).map((c) => ({ name: c.label, الإيرادات: c.p.revenue, "صافي الربح": c.p.profit }));
+    }
+    const catKeys = (k) => [...new Set(cols.flatMap((c) => Object.keys(c.p[k])))];
+    const defs = [
+      { label: "إيرادات الطلبات (بعد الخصم)", get: (p) => p.revenue, sign: "+" },
+      { label: "مرتجعات واستردادات", get: (p) => p.refunds, sign: "−" },
+      { label: "مشتريات", get: (p) => p.purchases, sign: "−" },
+      ...catKeys("purchasesByCat").map((c) => ({ label: c, get: (p) => p.purchasesByCat[c] || 0, sub: true })),
+      { label: "مصروفات تشغيلية", get: (p) => p.expenses, sign: "−" },
+      ...catKeys("expensesByCat").map((c) => ({ label: c, get: (p) => p.expensesByCat[c] || 0, sub: true })),
+      { label: "رواتب وأجور وعمولات", get: (p) => p.wages, sign: "−" },
+      { label: "صافي الربح", get: (p) => p.profit, strong: true },
+      { label: "هامش الربح %", get: (p) => p.revenue ? `${fmtNum(p.profit / p.revenue * 100)}%` : "—", pct: true },
+      { label: "حصص أرباح الموظفين", get: (p) => p.shares, sign: "−" },
+      { label: "الصافي بعد الحصص", get: (p) => p.net, strong: true },
+    ];
+    head = ["البند", ...cols.map((c) => c.label)];
+    tableRows = defs.map((r) => ({ label: `${r.sign ? r.sign + " " : ""}${r.label}`, cells: cols.map((c) => { const v = r.get(c.p); return typeof v === "number" ? money(v) : v; }), nums: cols.map((c) => r.get(c.p)), strong: r.strong, sub: r.sub, pct: r.pct, totalCol: cols.map((c) => !!c.total) }));
+  }
+  const th = { padding: "8px 10px", textAlign: "right", whiteSpace: "nowrap" };
+  const periodText = mode === "branches" ? `شهر ${month}` : `من ${fromM} إلى ${toM}${mode === "months" ? (effBranch ? ` — ${bName(effBranch)}` : " — كل الفروع") : ` — ${metrics[metric][0]}`}`;
+  const palette = [THEME.brass, THEME.teal, "#7A1F2B", "#1F3A68", "#B8860B", "#6B8E23"];
+  const branchOptions = [...(isAdmin ? [{ value: "", label: "كل الفروع (إجمالي)" }] : []), ...data.branches.map((b) => ({ value: b.id, label: b.name }))];
+  return (
+    <Panel style={{ marginTop: 16 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
+        <div style={{ fontWeight: 700, fontSize: 16 }}>قائمة الأرباح والخسائر — لكل فرع على حدة</div>
+        <Btn small variant="ghost" onClick={() => setPrinting(true)}><Printer size={13} />طباعة</Btn>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))", gap: 8, marginBottom: 6 }}>
+        <Field label="العرض"><SelectInput options={[{ value: "branches", label: "مقارنة الفروع (شهر واحد)" }, { value: "matrix", label: "مقارنة الفروع عبر الأشهر" }, { value: "months", label: "فرع واحد عبر الأشهر" }]} value={mode} onChange={(e) => setMode(e.target.value)} /></Field>
+        {mode === "branches" ? <Field label="الشهر"><TextInput type="month" value={month} onChange={(e) => setMonth(e.target.value)} /></Field> : (
+          <>
+            <Field label="من شهر"><TextInput type="month" value={fromM} onChange={(e) => setFromM(e.target.value)} /></Field>
+            <Field label="إلى شهر"><TextInput type="month" value={toM} onChange={(e) => setToM(e.target.value)} /></Field>
+            {mode === "months" && data.branches.length > 1 && <Field label="الفرع"><SelectInput options={branchOptions} value={branch} onChange={(e) => setBranch(e.target.value)} /></Field>}
+            {mode === "matrix" && <Field label="المؤشر"><SelectInput options={Object.entries(metrics).map(([value, m]) => ({ value, label: m[0] }))} value={metric} onChange={(e) => setMetric(e.target.value)} /></Field>}
+          </>
+        )}
+      </div>
+      <div style={{ overflowX: "auto" }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13.5 }}>
+          <thead><tr style={{ background: "#EFE7D6" }}>{head.map((h, i) => <th key={i} style={th}>{h}</th>)}</tr></thead>
+          <tbody>
+            {tableRows.map((r, i) => (
+              <tr key={i} style={{ borderTop: r.strong ? `2px solid ${THEME.brass}` : `1px solid ${THEME.border}`, fontWeight: r.strong ? 700 : 400, background: r.strong ? `${THEME.brass}14` : "transparent", color: r.sub || r.pct ? "#7A7061" : "inherit", fontSize: r.sub || r.pct ? 12.5 : 13.5 }}>
+                <td style={{ padding: "7px 10px", paddingRight: r.sub ? 26 : 10, fontWeight: r.strong || mode === "matrix" ? 700 : "inherit" }}>{r.label}</td>
+                {r.cells.map((c, j) => { const n = r.nums?.[j]; const isLast = mode === "matrix" && j === r.cells.length - 1; return <td key={j} style={{ padding: "7px 10px", fontWeight: (r.best?.[j] || isLast) ? 700 : "inherit", color: typeof n === "number" && (r.strong || mode === "matrix") ? (n < 0 ? THEME.red : (r.best?.[j] ? THEME.teal : "inherit")) : undefined, background: r.totalCol?.[j] ? "#F3EBDA" : undefined }}>{c}{r.best?.[j] ? " ★" : ""}</td>; })}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {mode === "matrix" && <div style={{ fontSize: 11.5, color: "#8A8071", marginTop: 6 }}>★ = أعلى فرع في ذلك الشهر.</div>}
+      {chartData.length > 1 && (
+        <div style={{ width: "100%", height: 240, marginTop: 14 }}>
+          <ResponsiveContainer>
+            <BarChart data={chartData}>
+              <CartesianGrid strokeDasharray="3 3" stroke={THEME.border} /><XAxis dataKey="name" fontSize={11} /><YAxis fontSize={11} /><Tooltip /><Legend />
+              {mode === "matrix" ? data.branches.map((b, i) => <Bar key={b.id} dataKey={b.name} fill={palette[i % palette.length]} radius={[4, 4, 0, 0]} />) : <><Bar dataKey="الإيرادات" fill={THEME.brass} radius={[4, 4, 0, 0]} /><Bar dataKey="صافي الربح" fill={THEME.teal} radius={[4, 4, 0, 0]} /></>}
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+      )}
+      <div style={{ fontSize: 11.5, color: "#8A8071", marginTop: 8 }}>الإيراد = قيمة الطلبات غير الملغاة في شهر إنشائها بعد الخصم (استحقاق لا نقد). المشتريات والمصروفات حسب فرعها وتاريخها؛ سندات الموردين والموظفين لا تُحسب مصروفًا لأن المشتريات والرواتب محسوبة أصلًا. الرواتب والمكافآت للموظف متعدد الفروع تُوزَّع بنسب فروعه.{isAdmin ? "" : " إجمالي الفروع يراه مدير النظام فقط."}</div>
+
+      {printing && (
+        <Modal title="طباعة قائمة الأرباح والخسائر" onClose={() => setPrinting(false)} width={900}>
+          <PrintStage data={data} docType="statement" tplId={tplId} setTplId={setTplId}>
+            <PrintSheet data={data} tpl={tpl} title="قائمة الأرباح والخسائر" date={todayStr()} meta={[{ label: "الفترة", value: periodText }, { label: "العرض", value: mode === "branches" ? "مقارنة الفروع" : mode === "matrix" ? "الفروع عبر الأشهر" : "فرع عبر الأشهر" }]} signatures={["المحاسب", "المدير"]}>
+              <PTable tpl={tpl} columns={head.map((h, i) => ({ key: `c${i}`, label: h, align: i ? "center" : "right" }))}
+                rows={tableRows.map((r, i) => { const o = { key: i, c0: `${r.sub ? "   " : ""}${r.label}` }; r.cells.forEach((c, j) => { o[`c${j + 1}`] = c; }); return o; })} />
+            </PrintSheet>
+          </PrintStage>
+        </Modal>
+      )}
+    </Panel>
+  );
+}
+
+// ---------- Month close ----------
+// A closed month is frozen: nobody but the system admin can add, cancel, delete or change anything dated in it,
+// and the admin gets an explicit warning first (he is never blocked).
+const isMonthClosed = (data, d) => (data.closedPeriods || []).some((p) => p.month === String(d || "").slice(0, 7));
+function periodAllowed(data, dateStr, what) {
+  if (!dateStr || !isMonthClosed(data, dateStr)) return true;
+  const m = String(dateStr).slice(0, 7);
+  if (!data._isAdmin) { alert(`شهر ${m} مقفل ولا يمكن ${what}. اطلب ذلك من مدير النظام.`); return false; }
+  return window.confirm(`شهر ${m} مقفل. ${what} سيغيّر أرقامًا مقفلة. كمدير للنظام يمكنك المتابعة. هل تتابع؟`);
+}
+function ClosePeriodsPanel({ data, update, currentUser }) {
+  const isAdmin = !!data._isAdmin;
+  const now = new Date(); const ym = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+  const [month, setMonth] = useState(ym(new Date(now.getFullYear(), now.getMonth() - 1, 1)));
+  const closed = [...(data.closedPeriods || [])].sort((a, b) => b.month.localeCompare(a.month));
+  const ledger = data.employeeLedger || [];
+  const unsalaried = data.employees.filter((e) => Number(e.baseSalary) > 0 && !ledger.some((l) => l.employeeId === e.id && l.kind === "راتب" && l.month === month));
+  const noShare = data.employees.filter((e) => Number(e.profitSharePercent) > 0 && !ledger.some((l) => l.employeeId === e.id && l.kind === "أرباح" && l.month === month));
+  const openOrders = data.orders.filter((o) => !o.cancelled && o.stage !== "تم التسليم" && String(o.createdAt || "").slice(0, 7) === month).length;
+  const alreadyClosed = isMonthClosed(data, `${month}-01`);
+  const close = () => {
+    if (!month) return;
+    const warnings = [];
+    if (unsalaried.length) warnings.push(`${unsalaried.length} موظف لم تُثبَّت رواتبهم`);
+    if (noShare.length) warnings.push(`${noShare.length} موظف لم تُثبَّت نسبة أرباحهم`);
+    if (month >= ym(now)) warnings.push("الشهر لم ينتهِ بعد");
+    if (!window.confirm(`إقفال شهر ${month}؟ لن يستطيع أحد غير مدير النظام تعديل أي شيء مؤرَّخ فيه.${warnings.length ? `\n\nتنبيهات: ${warnings.join("، ")}.` : ""}`)) return;
+    const snapshot = {}; data.branches.forEach((b) => { const r = branchPnL(data, month, b.id); snapshot[b.id] = { revenue: r.revenue, profit: r.profit, net: r.net }; });
+    update({ closedPeriods: [...(data.closedPeriods || []), { id: uid("cl"), month, closedAt: new Date().toISOString(), by: currentUser, snapshot }], auditLog: [...(data.auditLog || []), logEntry(currentUser, "إقفال شهر", month)] });
+  };
+  const reopen = (pr) => {
+    if (!window.confirm(`إعادة فتح شهر ${pr.month}؟ سيتمكن المستخدمون من التعديل عليه من جديد.`)) return;
+    update({ closedPeriods: (data.closedPeriods || []).filter((x) => x.id !== pr.id), auditLog: [...(data.auditLog || []), logEntry(currentUser, "إعادة فتح شهر", pr.month)] });
+  };
+  return (
+    <Panel style={{ marginBottom: 20 }}>
+      <div style={{ fontWeight: 700, fontSize: 16, marginBottom: 4 }}>🔒 إقفال الأشهر</div>
+      <div style={{ fontSize: 12.5, color: "#7A7061", marginBottom: 10 }}>الشهر المقفل لا يُضاف إليه سند ولا مشتريات ولا مرتجع ولا يُلغى أو يُحذف منه شيء، إلا بإذن مدير النظام.</div>
+      {isAdmin && (
+        <div style={{ background: `${THEME.brass}12`, border: `1px solid ${THEME.brass}`, borderRadius: 8, padding: 12, marginBottom: 12 }}>
+          <div style={{ display: "flex", gap: 10, alignItems: "flex-end", flexWrap: "wrap" }}>
+            <div style={{ width: 180 }}><Field label="الشهر المراد إقفاله"><TextInput type="month" value={month} onChange={(e) => setMonth(e.target.value)} /></Field></div>
+            <Btn variant="brass" onClick={close} disabled={alreadyClosed} style={{ marginBottom: 12 }}>{alreadyClosed ? "مقفل" : "إقفال الشهر"}</Btn>
+          </div>
+          <div style={{ fontSize: 12.5, lineHeight: 1.9 }}>
+            <div>{unsalaried.length ? "⚠" : "✓"} الرواتب: {unsalaried.length ? `لم تُثبَّت لـ ${unsalaried.map((e) => e.name).join("، ")}` : "مُثبتة لكل أصحاب الرواتب"}</div>
+            <div>{noShare.length ? "⚠" : "✓"} نسب الأرباح: {noShare.length ? `لم تُثبَّت لـ ${noShare.map((e) => e.name).join("، ")}` : "مُثبتة (أو لا توجد نسب)"}</div>
+            <div>{openOrders ? "ℹ" : "✓"} طلبات الشهر غير المسلّمة: {openOrders}</div>
+          </div>
+        </div>
+      )}
+      {closed.length === 0 ? <div style={{ fontSize: 13, color: "#8A8071" }}>لا توجد أشهر مقفلة.</div> : closed.map((c) => (
+        <div key={c.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, padding: "8px 0", borderBottom: `1px dashed ${THEME.border}`, fontSize: 13.5, flexWrap: "wrap" }}>
+          <span><b>🔒 {c.month}</b> — أقفله {c.by || "—"} في {new Date(c.closedAt).toLocaleDateString("ar-SA")}</span>
+          <span style={{ fontSize: 12.5, color: "#5C5344" }}>
+            {data.branches.map((b) => c.snapshot?.[b.id] ? `${b.name}: ${fmtNum(c.snapshot[b.id].profit)}` : null).filter(Boolean).join(" | ")}
+            {isAdmin && data.branches.length > 1 && c.snapshot ? ` | الإجمالي: ${fmtNum(Object.values(c.snapshot).reduce((t, x) => t + (x.profit || 0), 0))}` : ""}
+          </span>
+          {isAdmin && <Btn small variant="danger" onClick={() => reopen(c)}>إعادة فتح</Btn>}
         </div>
       ))}
     </Panel>
@@ -1442,7 +1968,9 @@ function customerStatementRows(data, c) {
   const def = data.branches[0]?.id;
   const orders = data.orders.filter((o) => o.customerId === c.id && !o.cancelled);
   const ids = new Set(orders.map((o) => o.id));
+  const refunds = liveVouchers(data).filter((v) => v.type === "صرف" && v.category === "مرتجع عميل" && v.orderId && ids.has(v.orderId)).map((v) => ({ key: v.id, no: v.voucherNo, noLabel: "سند", isVoucher: true, voucher: v, date: v.date, createdAt: v.createdAt || "", desc: v.description || "مرتجع", kind: "مرتجع", inc: Number(v.amount) || 0, dec: 0, branch: v.branch || data.orders.find((o) => o.id === v.orderId)?.branch || def }));
   const rows = [
+    ...refunds,
     ...orders.map((o) => ({ key: o.id, no: o.orderNo, noLabel: "طلب", date: o.createdAt, createdAt: "", desc: `${o.orderType || "طلب"}${Number(o.discount) > 0 ? ` (بعد خصم ${fmtNum(o.discount)})` : ""}`, kind: "طلبات", inc: Math.max(0, (Number(o.price) || 0) - (Number(o.discount) || 0)), dec: 0, branch: o.branch || def })),
     ...liveVouchers(data).filter((v) => v.type === "قبض" && v.orderId && ids.has(v.orderId)).map((v) => ({ key: v.id, no: v.voucherNo, noLabel: "سند", isVoucher: true, voucher: v, date: v.date, createdAt: v.createdAt || "", desc: v.description || "دفعة", kind: v.category || "دفعة", inc: 0, dec: Number(v.amount) || 0, branch: v.branch || data.orders.find((o) => o.id === v.orderId)?.branch || def })),
   ].sort((a, b) => (a.date || "").localeCompare(b.date || "") || (a.createdAt || "").localeCompare(b.createdAt || ""));
@@ -1705,6 +2233,7 @@ function OrdersView({ data, update, canEdit, currentUser, currentUserRole }) {
   const recordPayment = (order, amount, method) => {
     const amt = Number(amount);
     if (!amt || amt <= 0) { alert("أدخل مبلغًا صحيحًا"); return; }
+    if (!periodAllowed(data, todayStr(), "تسجيل دفعة اليوم")) return;
     const accountId = PAYMENT_ACCOUNT_MAP[method];
     if (!accountId) { alert("طريقة الدفع هذه (تقسيط) تحتاج ربط مزوّد خارجي فعلي ولا يمكن تسجيلها في الصندوق مباشرة الآن"); return; }
     const bv = buildVoucher(data.counters, { type: "قبض", accountId, branch: order.branch, category: "دفعة على الحساب", amount: amt, description: `دفعة لطلب #${order.orderNo || order.id.slice(-6)} — ${custName(order.customerId)}`, date: todayStr(), orderId: order.id, partyType: "عميل", partyId: order.customerId }, currentUser, data);
@@ -1726,7 +2255,9 @@ function OrdersView({ data, update, canEdit, currentUser, currentUserRole }) {
 
   const isSystemAdmin = currentUserRole === "مدير عام";
   const [delOrder, setDelOrder] = useState(null);
+  const [returnFor, setReturnFor] = useState(null);
   const permanentlyDeleteOrder = (order, freeNo) => {
+    if (!periodAllowed(data, order.createdAt, "حذف طلب من هذا الشهر")) return;
     const cv = cancelVouchersWhere(data, (v) => v.orderId === order.id, `حذف نهائي للطلب #${order.orderNo || order.id.slice(-6)}`, currentUser);
     const { vouchers, financeAccounts } = cv;
     const orders = data.orders.filter((o) => o.id !== order.id);
@@ -1737,6 +2268,7 @@ function OrdersView({ data, update, canEdit, currentUser, currentUserRole }) {
 
   return (
     <>
+      {returnFor && <ReturnModal data={data} update={update} order={returnFor} currentUser={currentUser} onClose={(r) => { setReturnFor(null); if (r) setDetail(null); }} />}
       {delOrder && <AdminDeleteModal title={`حذف نهائي للطلب #${delOrder.orderNo || ""}`} numberLabel="رقم الطلب" number={delOrder.orderNo} lines={["يُحذف الطلب مع قيود الموظفين المرتبطة به، وتُلغى سنداته وتُعاد أرصدة الحسابات."]} onConfirm={(free) => permanentlyDeleteOrder(delOrder, free)} onClose={() => setDelOrder(null)} />}
       <CrudSection icon={ShoppingBag} title="إدارة الطلبات" addLabel="طلب جديد" columns={["الرقم", "العميل", "النوع", "الطلبية", "الفرع", "التسليم", "المرحلة", "الموقع"]} items={data.orders} searchKeys={["orderNo"]}
         onAdd={canEdit ? () => data.customers.length ? setModal({ ...emptyOrder(data) }) : alert("أضف عميلاً أولاً من قسم إدارة العملاء") : undefined}
@@ -1744,6 +2276,7 @@ function OrdersView({ data, update, canEdit, currentUser, currentUserRole }) {
         onDelete={canEdit ? (it) => {
           if (it.cancelled) { alert("هذا الطلب ملغى بالفعل."); return; }
           if (!window.confirm(`سيتم إلغاء الطلب #${it.orderNo || it.id.slice(-6)} مع الاحتفاظ بسجله (لا يُحذف نهائيًا). متابعة؟`)) return;
+          if (!periodAllowed(data, it.createdAt, "إلغاء طلب من هذا الشهر")) return;
           const cv = cancelVouchersWhere(data, (v) => v.orderId === it.id, `إلغاء الطلب #${it.orderNo || it.id.slice(-6)}`, currentUser);
           const { vouchers, financeAccounts } = cv;
           const orders = data.orders.map((o) => o.id === it.id ? { ...o, cancelled: true, cancelledAt: new Date().toLocaleString("ar-SA") } : o);
@@ -1841,6 +2374,7 @@ function OrdersView({ data, update, canEdit, currentUser, currentUserRole }) {
                   {canEdit ? <WhatsAppNotifyButton order={detail} data={data} update={update} custPhone={data.customers.find((c) => c.id === detail.customerId)?.phone} custName={custName(detail.customerId)} /> : <div style={{ fontSize: 12, color: "#8A8071" }}>لا تملك صلاحية إرسال إشعارات.</div>}
                 </div>
               )}
+              {canEdit && !detail.cancelled && <div style={{ marginTop: 14 }}><Btn small variant="ghost" onClick={() => setReturnFor(detail)}>↩ مرتجع / تعديل</Btn>{Number(detail.returnedAmount) > 0 && <span style={{ fontSize: 12.5, color: THEME.red, marginRight: 10 }}>استُرد سابقًا: {fmtNum(detail.returnedAmount)} ر.س</span>}</div>}
               {canEdit && orderBalance(detail) > 0 && !detail.cancelled && (
                 <div style={{ marginTop: 14, background: `#C7770018`, border: `1px solid #C77700`, borderRadius: 8, padding: 12 }}>
                   <div style={{ fontWeight: 700, color: "#C77700", marginBottom: 8 }}>💰 المتبقي على العميل {fmtNum(orderBalance(detail))} ر.س</div>
@@ -1995,7 +2529,7 @@ function CourierView({ data, update, canEdit }) {
       const recordedEmp = dataRef.current.employees.find((e) => e.id === recordedId);
       logNote = `استلام من ${stage}${recordedEmp ? " — " + recordedEmp.name : ""}`;
     }
-    const updated = { ...order, ...assignmentPatch, stage: nextStage, stageLog: [...(order.stageLog || []), { stage: nextStage, at: new Date().toLocaleString("ar-SA"), note: logNote, courier: courier || undefined }] };
+    const updated = { ...order, ...assignmentPatch, stage: nextStage, stageLog: [...(order.stageLog || []), { stage: nextStage, at: new Date().toLocaleString("ar-SA"), ts: new Date().toISOString(), note: logNote, courier: courier || undefined }] };
     updateRef.current({ orders: dataRef.current.orders.map((o) => o.id === updated.id ? updated : o), ...ledgerPatch });
     return updated;
   };
@@ -2298,7 +2832,10 @@ function EmployeesView({ data, update, canEdit, currentUser }) {
     let shares = {};
     if (brs.length > 1) {
       const total = brs.reduce((t, id) => t + (Number(values.branchShares?.[id]) || 0), 0);
-      if (Math.abs(total - 100) > 0.01) { alert(`مجموع نسب الفروع يجب أن يساوي 100% (الحالي ${fmtNum(total)}%)`); return; }
+      if (Math.abs(total - 100) > 0.01) {
+        if (!data._isAdmin) { alert(`مجموع نسب الفروع يجب أن يساوي 100% (الحالي ${fmtNum(total)}%)`); return; }
+        if (!window.confirm(`مجموع النسب ${fmtNum(total)}% وليس 100%. سيُوزَّع الراتب بنسبة كل فرع إلى المجموع. هل تتابع؟`)) return;
+      }
       brs.forEach((id) => { shares[id] = Number(values.branchShares[id]) || 0; });
     }
     const clean = { ...values, branches: brs, branch: brs[0], branchShares: shares };
@@ -2311,6 +2848,7 @@ function EmployeesView({ data, update, canEdit, currentUser }) {
     const { employee, values } = payModal;
     const amt = Number(values.amount);
     if (!amt || amt <= 0) { alert("أدخل مبلغًا صحيحًا"); return; }
+    if (!periodAllowed(data, values.date || todayStr(), "تسجيل صرف بهذا التاريخ")) return;
     const isAdvance = values.kind === "سلفة موظف";
     const bv = buildVoucher(data.counters, { type: "صرف", accountId: values.accountId, branch: values.branch || empBranches(data, employee)[0], category: isAdvance ? "سلفة موظف" : "رواتب", amount: amt, description: values.note || (isAdvance ? `سلفة للموظف ${employee.name}` : `صرف مستحقات الموظف ${employee.name}`), date: values.date || todayStr(), partyType: "موظف", partyId: employee.id, employeeId: employee.id, partyName: employee.name, partyPhone: employee.phone || "" }, currentUser, data);
     const financeAccounts = data.financeAccounts.map((a) => a.id === values.accountId ? { ...a, balance: (Number(a.balance) || 0) - amt } : a);
@@ -2323,6 +2861,7 @@ function EmployeesView({ data, update, canEdit, currentUser }) {
     const { employee, values } = adjModal;
     const amt = Number(values.amount);
     if (!amt || amt <= 0) { alert("أدخل مبلغًا صحيحًا"); return; }
+    if (!periodAllowed(data, values.date || todayStr(), "تسجيل مكافأة أو خصم بهذا التاريخ")) return;
     const n = nextCounter(data.counters, "empEntry", 5000);
     const isBonus = values.kind === "مكافأة";
     const entry = { id: uid("el"), entryNo: n.no, employeeId: employee.id, date: values.date || todayStr(), createdAt: new Date().toISOString(), kind: values.kind, desc: values.note || values.kind, credit: isBonus ? amt : 0, debit: isBonus ? 0 : amt, by: currentUser };
@@ -2339,6 +2878,7 @@ function EmployeesView({ data, update, canEdit, currentUser }) {
   const salaryDone = (empId, month) => (data.employeeLedger || []).some((l) => l.employeeId === empId && l.kind === "راتب" && l.month === month);
   const saveSalaries = () => {
     const { month, monthDays, rows } = salaryModal;
+    if (!periodAllowed(data, `${month}-01`, "إثبات رواتب هذا الشهر")) return;
     let counters = data.counters; const added = [];
     data.employees.filter((e) => rows[e.id]?.include && !salaryDone(e.id, month)).forEach((e) => {
       const days = Number(rows[e.id].days) || 0; const md = Number(monthDays) || 30;
@@ -2356,26 +2896,14 @@ function EmployeesView({ data, update, canEdit, currentUser }) {
   // Purchases / vouchers / orders belong to their own branch; purchases saved before branches
   // existed count toward the first branch. Wages count toward the branch of the employee who earned them.
   const defaultBranch = data.branches[0]?.id;
-  const computeProfit = (month, branchId) => {
-    const inMonth = (d) => String(d || "").slice(0, 7) === month;
-    const sumBy = (arr, f) => round2(arr.reduce((t, x) => t + (Number(f(x)) || 0), 0));
-    const revenue = sumBy(data.orders.filter((o) => !o.cancelled && o.branch === branchId && inMonth(o.createdAt)), (o) => Math.max(0, (Number(o.price) || 0) - (Number(o.discount) || 0)));
-    const purchases = sumBy(data.purchases.filter((x) => (x.branch || defaultBranch) === branchId && inMonth(x.date)), (x) => x.cost);
-    const expenses = sumBy(liveVouchers(data).filter((v) => v.type === "صرف" && (v.branch || defaultBranch) === branchId && inMonth(v.date) && !v.employeeId && !v.supplierId), (v) => v.amount);
-    const wages = round2((data.employeeLedger || []).filter((l) => ["راتب", "قطعة", "نسبة", "مكافأة"].includes(l.kind) && (l.month ? l.month === month : inMonth(l.date))).reduce((t, l) => {
-      const emp = data.employees.find((e) => e.id === l.employeeId);
-      const ord = l.orderId ? data.orders.find((o) => o.id === l.orderId) : null;
-      const w = ord ? ((ord.branch || defaultBranch) === branchId ? 1 : 0) : (emp ? empBranchWeight(data, emp, branchId) : (defaultBranch === branchId ? 1 : 0));
-      return t + (Number(l.credit) || 0) * w;
-    }, 0));
-    return { revenue, purchases, expenses, wages, profit: round2(revenue - purchases - expenses - wages) };
-  };
+  const computeProfit = (month, branchId) => { const p = branchPnL(data, month, branchId); return { revenue: p.revenue, purchases: p.purchases, expenses: round2(p.expenses + p.refunds), wages: p.wages, profit: p.profit }; };
   const profitBranches = () => data.branches.filter((br) => data.employees.some((e) => empBranches(data, e).includes(br.id) && Number(e.profitSharePercent) > 0));
   const profitDone = (empId, month, branchId) => (data.employeeLedger || []).some((l) => l.employeeId === empId && l.kind === "أرباح" && l.month === month && (!l.branchId || l.branchId === branchId));
   const calcProfits = (month) => { const o = {}; profitBranches().forEach((br) => { o[br.id] = computeProfit(month, br.id).profit; }); return o; };
   const openProfit = () => { const month = todayStr().slice(0, 7); setProfitModal({ month, profits: calcProfits(month), include: {} }); };
   const saveProfit = () => {
     const { month, profits, include } = profitModal;
+    if (!periodAllowed(data, `${month}-01`, "إثبات نسب أرباح هذا الشهر")) return;
     let counters = data.counters; const added = [];
     data.employees.filter((e) => Number(e.profitSharePercent) > 0).forEach((e) => empBranches(data, e).forEach((br) => {
       if (include[`${e.id}:${br}`] === false || profitDone(e.id, month, br)) return;
@@ -2391,6 +2919,7 @@ function EmployeesView({ data, update, canEdit, currentUser }) {
   };
 
   const removeEntry = (entry) => {
+    if (!periodAllowed(data, entry.date, "حذف قيد من هذا الشهر")) return;
     if (!window.confirm(`حذف القيد رقم ${entry.no}؟ سيتغيّر رصيد الموظف.`)) return;
     update({ employeeLedger: (data.employeeLedger || []).filter((l) => l.id !== entry.key), auditLog: [...(data.auditLog || []), logEntry(currentUser, "حذف قيد موظف", `قيد #${entry.no} — ${entry.desc}`)] });
   };
@@ -2580,7 +3109,7 @@ function SuppliersView({ data, update, canEdit }) {
   const [printingPurchase, setPrintingPurchase] = useState(null);
   const sFields = [{ key: "name", label: "اسم المورد" }, { key: "phone", label: "الجوال" }, { key: "materialType", label: "نوع المواد (أقمشة، أزرار، خيوط...)" }, { key: "openingBalance", label: "الرصيد الافتتاحي (ر.س) — ما كنت مديون به له قبل النظام", type: "number" }];
   const saveSupplier = (values) => { const list = [...data.suppliers]; if (sModal.mode === "add") list.push({ id: uid("sup"), ...values }); else { const i = list.findIndex((s) => s.id === values.id); list[i] = values; } update({ suppliers: list }); setSModal(null); };
-  const categories = ["قماش", "أزرار", "خيوط", "بطانة", "أخرى"];
+  const categories = getList(data, "purchaseCategories");
   const pFields = [
     { key: "supplierId", label: "المورد", type: "select", options: data.suppliers.map((s) => ({ value: s.id, label: s.name })) },
     { key: "branch", label: "الفرع (لحساب أرباح الفرع)", type: "select", options: data.branches.map((b) => ({ value: b.id, label: b.name })) },
@@ -2592,6 +3121,7 @@ function SuppliersView({ data, update, canEdit }) {
   // buying an item that is not in the inventory catalog yet adds it automatically
   const [delPurchase, setDelPurchase] = useState(null);
   const deletePurchase = (pu, free) => {
+    if (!periodAllowed(data, pu.date, "حذف مشتريات من هذا الشهر")) return;
     update({ purchases: data.purchases.filter((x) => x.id !== pu.id), auditLog: [...(data.auditLog || []), logEntry("مدير النظام", "حذف عملية شراء", `#${pu.purchaseNo} — ${pu.item}${free ? " — الرقم أُتيح لإعادة الاستخدام" : ""}`)], ...withFreed(data, "purchase", pu.purchaseNo, free) });
     setDelPurchase(null);
   };
@@ -2601,6 +3131,7 @@ function SuppliersView({ data, update, canEdit }) {
     return { inventoryItems: [...items, { id: uid("inv"), name: String(values.item).trim(), category: values.category || "أخرى", unit: values.unit || "", minQty: 0 }] };
   };
   const savePurchase = (values) => {
+    if (!periodAllowed(data, values.date, "تسجيل أو تعديل مشتريات بهذا التاريخ")) return;
     const list = [...data.purchases];
     if (pModal.mode === "add") {
       const t = issueNumber(data, data.counters, "purchase", 1000, data.purchases.map((x) => x.purchaseNo));
@@ -2625,6 +3156,7 @@ function SuppliersView({ data, update, canEdit }) {
   const savePayment = () => {
     const amt = Number(payModal.values.amount);
     if (!amt || amt <= 0) { alert("أدخل مبلغًا صحيحًا"); return; }
+    if (!periodAllowed(data, payModal.values.date || todayStr(), "تسجيل دفعة بهذا التاريخ")) return;
     const bv = buildVoucher(data.counters, { type: "صرف", accountId: payModal.values.accountId, branch: data.branches[0]?.id, category: "دفعة لمورد", amount: amt, description: `دفعة للمورد ${payModal.supplier.name}`, date: payModal.values.date || todayStr(), supplierId: payModal.supplier.id, partyType: "مورد", partyId: payModal.supplier.id }, undefined, data);
     const vouchers = [...data.vouchers, bv.voucher];
     const financeAccounts = data.financeAccounts.map((a) => a.id === payModal.values.accountId ? { ...a, balance: (Number(a.balance) || 0) - amt } : a);
@@ -2794,9 +3326,11 @@ function FinanceView({ data, update, canEdit, currentUser }) {
   const [cancelModal, setCancelModal] = useState(null);
   const [delVoucher, setDelVoucher] = useState(null);
   const deleteVoucherForever = (v, free) => {
+    if (!periodAllowed(data, v.date, "حذف سند من هذا الشهر")) return;
     const live = v.status !== "cancelled"; const amt = Number(v.amount) || 0;
     const financeAccounts = live ? data.financeAccounts.map((a) => a.id === v.accountId ? { ...a, balance: round2((Number(a.balance) || 0) + (v.type === "قبض" ? -amt : amt)) } : a) : data.financeAccounts;
-    const orders = live && v.orderId && v.type === "قبض" ? data.orders.map((o) => o.id === v.orderId ? { ...o, deposit: Math.max(0, (Number(o.deposit) || 0) - amt) } : o) : data.orders;
+    const orders = live && v.orderId && v.type === "قبض" ? data.orders.map((o) => o.id === v.orderId ? { ...o, deposit: Math.max(0, (Number(o.deposit) || 0) - amt) } : o)
+      : live && v.orderId && v.category === "مرتجع عميل" ? data.orders.map((o) => o.id === v.orderId ? { ...o, deposit: (Number(o.deposit) || 0) + amt } : o) : data.orders;
     const auditLog = [...(data.auditLog || []), logEntry(currentUser, "حذف نهائي لسند (مدير النظام)", `سند ${v.type} رقم ${v.voucherNo} — ${fmtNum(amt)} ر.س${free ? " — الرقم أُتيح لإعادة الاستخدام" : ""}`)];
     update({ vouchers: data.vouchers.filter((x) => x.id !== v.id), financeAccounts, orders, auditLog, ...withFreed(data, "voucher", v.voucherNo, free) });
     setDelVoucher(null);
@@ -2804,10 +3338,12 @@ function FinanceView({ data, update, canEdit, currentUser }) {
   const cancelVoucher = () => {
     const { voucher: v, reason } = cancelModal;
     if (!String(reason || "").trim()) { alert("اكتب سبب الإلغاء"); return; }
+    if (!periodAllowed(data, v.date, "إلغاء سند من هذا الشهر")) return;
     const cv = cancelVouchersWhere(data, (x) => x.id === v.id, reason.trim(), currentUser);
     if (!cv.count) { setCancelModal(null); return; }
     const amt = Number(v.amount) || 0;
-    const orders = v.orderId && v.type === "قبض" ? data.orders.map((o) => o.id === v.orderId ? { ...o, deposit: Math.max(0, (Number(o.deposit) || 0) - amt) } : o) : data.orders;
+    const orders = v.orderId && v.type === "قبض" ? data.orders.map((o) => o.id === v.orderId ? { ...o, deposit: Math.max(0, (Number(o.deposit) || 0) - amt) } : o)
+      : v.orderId && v.category === "مرتجع عميل" ? data.orders.map((o) => o.id === v.orderId ? { ...o, deposit: (Number(o.deposit) || 0) + amt } : o) : data.orders;
     const auditLog = [...(data.auditLog || []), logEntry(currentUser, "إلغاء سند", `سند ${v.type} رقم ${v.voucherNo} — ${fmtNum(amt)} ر.س — السبب: ${reason.trim()}`)];
     update({ vouchers: cv.vouchers, financeAccounts: cv.financeAccounts, orders, auditLog });
     setCancelModal(null);
@@ -2816,8 +3352,8 @@ function FinanceView({ data, update, canEdit, currentUser }) {
   const [jModal, setJModal] = useState(null);
   const [printingVoucher, setPrintingVoucher] = useState(null);
   const [printingJournal, setPrintingJournal] = useState(null);
-  const expenseCategories = ["إيجار", "رواتب", "فواتير خدمات", "صيانة", "أخرى"];
-  const incomeCategories = ["عربون", "دفعة على الحساب", "أخرى"];
+  const expenseCategories = getList(data, "expenseCategories");
+  const incomeCategories = getList(data, "incomeCategories");
   const vFields = [
     { key: "type", label: "نوع السند", type: "select", options: [{ value: "قبض", label: "سند قبض" }, { value: "صرف", label: "سند صرف" }] },
     { key: "accountId", label: "الحساب", type: "select", options: data.financeAccounts.map((a) => ({ value: a.id, label: a.name })) },
@@ -2826,6 +3362,7 @@ function FinanceView({ data, update, canEdit, currentUser }) {
   ];
   const saveVoucher = (values) => {
     if (!Number(values.amount) || Number(values.amount) <= 0) { alert("أدخل مبلغًا صحيحًا"); return; }
+    if (!periodAllowed(data, values.date || todayStr(), "إضافة سند بهذا التاريخ")) return;
     const extra = {};
     if (values.partyType === "موظف" && values.partyId) extra.employeeId = values.partyId;
     if (values.partyType === "مورد" && values.partyId) extra.supplierId = values.partyId;
@@ -2873,6 +3410,7 @@ function FinanceView({ data, update, canEdit, currentUser }) {
         </div>
       </Panel>
       <FinanceCharts data={filteredData} />
+      <ClosePeriodsPanel data={data} update={update} currentUser={currentUser} />
       {!data._scope && <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(160px,1fr))", gap: 14, marginBottom: 20 }}>
         {data.financeAccounts.map((a) => <Panel key={a.id}><div style={{ fontSize: 13, color: "#7A7061" }}>{a.name}</div><div style={{ fontSize: 22, fontWeight: 700 }}>{a.balance.toLocaleString()} ر.س</div></Panel>)}
       </div>}
@@ -2887,11 +3425,11 @@ function FinanceView({ data, update, canEdit, currentUser }) {
       </Panel>
 
       <CrudSection icon={Wallet} title="السندات (قبض / صرف)" addLabel="سند جديد" columns={["الرقم", "النوع", "الطرف", "الحساب", "التصنيف", "المبلغ", "البيان", "التاريخ", ""]} items={data.vouchers} searchKeys={["description", "voucherNo", "partyName"]}
-        onAdd={canEdit ? () => setVModal({ mode: "add", values: { type: "قبض", accountId: data.financeAccounts[0]?.id, branch: data.branches[0]?.id, category: incomeCategories[2], date: todayStr() } }) : undefined}
+        onAdd={canEdit ? () => setVModal({ mode: "add", values: { type: "قبض", accountId: data.financeAccounts[0]?.id, branch: data.branches[0]?.id, category: incomeCategories[incomeCategories.length - 1], date: todayStr() } }) : undefined}
         renderRow={(it) => {
           const pr = voucherPartyInfo(data, it); const dead = it.status === "cancelled";
           const cell = { padding: "10px 14px", opacity: dead ? 0.55 : 1, textDecoration: dead ? "line-through" : "none" };
-          return (<><td style={{ ...cell, fontWeight: 700, color: THEME.brass }}>{it.voucherNo || "—"}{dead && <div style={{ textDecoration: "none" }}><Badge color={THEME.red}>ملغى</Badge></div>}</td><td style={cell}><Badge color={it.type === "قبض" ? THEME.teal : THEME.red}>{it.type}</Badge></td><td style={{ ...cell, fontSize: 13 }}>{pr.find((r) => r.label === "الاسم")?.value || "—"}</td><td style={cell}>{data.financeAccounts.find((a) => a.id === it.accountId)?.name}</td><td style={cell}>{it.category || "—"}</td><td style={cell}>{fmtNum(it.amount)} ر.س</td><td style={cell}>{it.description}{dead && it.cancelReason && <div style={{ fontSize: 11.5, color: THEME.red, textDecoration: "none" }}>سبب الإلغاء: {it.cancelReason}</div>}</td><td style={cell}>{it.date}</td><td style={{ padding: "10px 14px", whiteSpace: "nowrap" }}><Btn small variant="ghost" onClick={() => setPrintingVoucher(it)}><Printer size={13} /></Btn>{canEdit && !dead && <Btn small variant="danger" onClick={() => setCancelModal({ voucher: it, reason: "" })} style={{ marginRight: 4 }}>إلغاء</Btn>}{canEdit && data._isAdmin && <Btn small variant="danger" onClick={() => setDelVoucher(it)} style={{ marginRight: 4 }} title="حذف نهائي (مدير النظام)"><Trash2 size={13} /></Btn>}</td></>);
+          return (<><td style={{ ...cell, fontWeight: 700, color: THEME.brass }}>{it.voucherNo || "—"}{dead && <div style={{ textDecoration: "none" }}><Badge color={THEME.red}>ملغى</Badge></div>}</td><td style={cell}><Badge color={it.type === "قبض" ? THEME.teal : THEME.red}>{it.type}</Badge></td><td style={{ ...cell, fontSize: 13 }}>{pr.find((r) => r.label === "الاسم")?.value || "—"}</td><td style={cell}>{data.financeAccounts.find((a) => a.id === it.accountId)?.name}</td><td style={cell}>{it.category || "—"}</td><td style={cell}>{fmtNum(it.amount)} ر.س</td><td style={cell}>{it.description}{dead && it.cancelReason && <div style={{ fontSize: 11.5, color: THEME.red, textDecoration: "none" }}>سبب الإلغاء: {it.cancelReason}</div>}</td><td style={cell}>{it.date}{isMonthClosed(data, it.date) ? " 🔒" : ""}</td><td style={{ padding: "10px 14px", whiteSpace: "nowrap" }}><Btn small variant="ghost" onClick={() => setPrintingVoucher(it)}><Printer size={13} /></Btn>{canEdit && !dead && <Btn small variant="danger" onClick={() => setCancelModal({ voucher: it, reason: "" })} style={{ marginRight: 4 }}>إلغاء</Btn>}{canEdit && data._isAdmin && <Btn small variant="danger" onClick={() => setDelVoucher(it)} style={{ marginRight: 4 }} title="حذف نهائي (مدير النظام)"><Trash2 size={13} /></Btn>}</td></>);
         }} />
       {delVoucher && <AdminDeleteModal title={`حذف نهائي للسند رقم ${delVoucher.voucherNo}`} numberLabel="رقم السند" number={delVoucher.voucherNo} lines={[`${delVoucher.type} بمبلغ ${fmtNum(delVoucher.amount)} ر.س — ${delVoucher.description || ""}`, delVoucher.status === "cancelled" ? "السند ملغى أصلًا، فلن يتغير رصيد الحساب." : "يُعاد أثره على رصيد الحساب."]} onConfirm={(free) => deleteVoucherForever(delVoucher, free)} onClose={() => setDelVoucher(null)} />}
       {cancelModal && (
@@ -2940,9 +3478,25 @@ function FinanceView({ data, update, canEdit, currentUser }) {
 }
 
 // ---------- Users / System admin ----------
-function UsersView({ data, update, canEdit, currentUser }) {
+function UsersView({ data, update, canEdit, currentUser, isAdmin }) {
   const [modal, setModal] = useState(null);
   const [branchName, setBranchName] = useState("");
+  const renameBranch = (b) => {
+    const name = window.prompt("الاسم الجديد للفرع:", b.name); if (!name || !name.trim() || name.trim() === b.name) return;
+    update({ branches: data.branches.map((x) => x.id === b.id ? { ...x, name: name.trim() } : x), auditLog: [...(data.auditLog || []), logEntry(currentUser, "تعديل اسم فرع", `${b.name} ← ${name.trim()}`)] });
+  };
+  const deleteBranch = (b) => {
+    if (data.branches.length <= 1) { alert("يجب أن يبقى فرع واحد على الأقل في النظام."); return; }
+    const refs = { طلبات: data.orders.filter((o) => o.branch === b.id).length, سندات: data.vouchers.filter((v) => v.branch === b.id).length, موظفين: data.employees.filter((e) => empBranches(data, e).includes(b.id)).length, مشتريات: (data.purchases || []).filter((x) => x.branch === b.id).length };
+    const used = Object.entries(refs).filter(([, n]) => n > 0).map(([k, n]) => `${n} ${k}`).join("، ");
+    if (!window.confirm(`حذف الفرع «${b.name}»؟${used ? `\nمرتبط به: ${used}. تبقى هذه السجلات في النظام لكن بلا فرع معروف، ولن تظهر في أرباح أي فرع.` : ""}`)) return;
+    update({
+      branches: data.branches.filter((x) => x.id !== b.id),
+      users: data.users.map((u) => (u.branches || []).includes(b.id) ? { ...u, branches: u.branches.filter((id) => id !== b.id) } : u),
+      employees: data.employees.map((e) => (e.branch === b.id || (e.branches || []).includes(b.id)) ? { ...e, branches: (e.branches || []).filter((id) => id !== b.id), branch: e.branch === b.id ? ((e.branches || []).filter((id) => id !== b.id)[0] || data.branches.find((x) => x.id !== b.id)?.id) : e.branch } : e),
+      auditLog: [...(data.auditLog || []), logEntry(currentUser, "حذف فرع (مدير النظام)", b.name)],
+    });
+  };
   const addBranch = () => { if (branchName.trim()) { update({ branches: [...data.branches, { id: uid("br"), name: branchName.trim() }] }); setBranchName(""); } };
   const toggleBranch = (values, bId) => { const cur = values.branches || []; const next = cur.includes(bId) ? cur.filter((x) => x !== bId) : [...cur, bId]; setModal({ ...modal, values: { ...values, branches: next } }); };
   const togglePerm = (values, moduleId, field) => {
@@ -2959,13 +3513,13 @@ function UsersView({ data, update, canEdit, currentUser }) {
     else { const i = list.findIndex((u) => u.id === toSave.id); list[i] = toSave; }
     update({ users: list }); setModal(null);
   };
-  const moduleLabels = { dashboard: "لوحة التحكم", customers: "العملاء", orders: "الطلبات", courier: "شاشة المراسل", appointments: "المواعيد", designs: "دليل التصاميم", invoices: "الفواتير", employees: "الموظفون", suppliers: "المشتريات", inventory: "المخزون", finance: "المالية", users: "المستخدمون", settings: "بيانات المحل", reports: "التقارير" };
+  const moduleLabels = { dashboard: "لوحة التحكم", customers: "العملاء", orders: "الطلبات", courier: "شاشة المراسل", appointments: "المواعيد", designs: "دليل التصاميم", invoices: "الفواتير", employees: "الموظفون", suppliers: "المشتريات", inventory: "المخزون", returns: "المرتجعات", finance: "المالية", users: "المستخدمون", settings: "بيانات المحل", reports: "التقارير" };
 
   return (
     <div>
       <Panel style={{ marginBottom: 20 }}>
         <div style={{ fontWeight: 700, marginBottom: 10 }}>الفروع</div>
-        <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 12 }}>{data.branches.map((b) => <Badge key={b.id} color={THEME.teal}>{b.name}</Badge>)}</div>
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 12 }}>{data.branches.map((b) => <span key={b.id} style={{ display: "inline-flex", alignItems: "center", gap: 6 }}><Badge color={THEME.teal}>{b.name}</Badge>{isAdmin && <><span style={{ cursor: "pointer", fontSize: 12, color: THEME.brass }} onClick={() => renameBranch(b)}>تعديل</span><span style={{ cursor: "pointer", fontSize: 12, color: THEME.red }} onClick={() => deleteBranch(b)}>حذف</span></>}</span>)}</div>
         {canEdit && <div style={{ display: "flex", gap: 8 }}><TextInput placeholder="اسم فرع جديد" value={branchName} onChange={(e) => setBranchName(e.target.value)} style={{ maxWidth: 220 }} /><Btn variant="brass" onClick={addBranch}><Plus size={16} />إضافة فرع</Btn></div>}
       </Panel>
 
@@ -3220,6 +3774,7 @@ function ShopSettingsView({ data, update, canEdit, backupApi, currentUser, isAdm
         </div>
       </Panel>
       <PrintTemplatesPanel data={data} update={update} />
+      {isAdmin && <ListsPanel data={data} update={update} />}
       {isAdmin && <FreedNumbersPanel data={data} update={update} />}
       {backupApi && <BackupPanel backupApi={backupApi} currentUser={currentUser} />}
     </div>
@@ -3362,7 +3917,9 @@ function ReportsView({ data }) {
           </ResponsiveContainer>
         </div>
       </Panel>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+      <PnLReport data={data} />
+      <EmployeePerformance data={data} />
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginTop: 16 }}>
         <Panel><div style={{ fontWeight: 700, marginBottom: 10 }}>أفضل 5 عملاء (حسب الإنفاق)</div>{topCustomers.length === 0 ? <EmptyState text="لا توجد بيانات" /> : topCustomers.map((c) => <div key={c.id} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: `1px dashed ${THEME.border}`, fontSize: 13.5 }}><span>{c.name}</span><span>{c.spend.toLocaleString()} ر.س — {c.count} طلب</span></div>)}</Panel>
         <Panel><div style={{ fontWeight: 700, marginBottom: 10 }}>الموظفون حسب الدور</div>{Object.keys(roleCounts).length === 0 ? <EmptyState text="لا توجد بيانات" /> : Object.entries(roleCounts).map(([role, count]) => <div key={role} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: `1px dashed ${THEME.border}`, fontSize: 13.5 }}><span>{role}</span><span>{count}</span></div>)}</Panel>
       </div>
@@ -3523,6 +4080,7 @@ const NAV = [
   { id: "employees", label: "الموظفون", icon: Briefcase },
   { id: "suppliers", label: "المشتريات والموردون", icon: Truck },
   { id: "inventory", label: "المخزون", icon: Package },
+  { id: "returns", label: "المرتجعات والتعديلات", icon: RotateCcw },
   { id: "finance", label: "الإدارة المالية", icon: Wallet },
   { id: "users", label: "المستخدمون والنظام", icon: ShieldCheck },
   { id: "settings", label: "بيانات المحل", icon: Store },
@@ -3606,6 +4164,9 @@ export default function App() {
         if (!parsed.employeeLedger) parsed.employeeLedger = [];
         parsed.shopSettings = { ...WA_NEW_DEFAULTS, ...(parsed.shopSettings || {}) };
         if (!parsed.freedNumbers) parsed.freedNumbers = {};
+        if (!parsed.returns) parsed.returns = [];
+        if (!parsed.closedPeriods) parsed.closedPeriods = [];
+        parsed.users = (parsed.users || []).map((u) => u.permissions && !u.permissions.returns ? { ...u, permissions: { ...u.permissions, returns: u.role === "مدير عام" ? { view: true, edit: true } : { ...(u.permissions.orders || { view: false, edit: false }) } } } : u);
         if (!parsed.stockAdjustments) parsed.stockAdjustments = [];
         if (!parsed.consumptionRules) parsed.consumptionRules = [];
         if (!parsed.inventoryItems) {
@@ -3753,12 +4314,13 @@ export default function App() {
   const activeUser = data.users.find((u) => u.id === sessionUserId);
   if (!activeUser) return <LoginScreen data={data} update={update} onLogin={handleLogin} />;
 
-  const visibleTabs = NAV.filter((n) => activeUser.permissions?.[n.id]?.view);
+  const isAdmin = activeUser.role === "مدير عام";   // the system admin has every permission on every screen, always
+  const visibleTabs = NAV.filter((n) => isAdmin || activeUser.permissions?.[n.id]?.view);
   const effectiveTab = visibleTabs.some((v) => v.id === tab) ? tab : (visibleTabs[0]?.id || "dashboard");
-  const canEdit = !!activeUser.permissions?.[effectiveTab]?.edit;
+  const canEdit = isAdmin || !!activeUser.permissions?.[effectiveTab]?.edit;
 
   const allowedBranches = userBranchScope(data, activeUser);
-  const sdata = { ...(allowedBranches ? scopeData(data, allowedBranches) : data), _isAdmin: activeUser.role === "مدير عام" };
+  const sdata = { ...(allowedBranches ? scopeData(data, allowedBranches) : data), _isAdmin: isAdmin };
   const supdate = allowedBranches ? (patch) => update(mergeScopedPatch(latestRef.current || data, allowedBranches, patch)) : update;
   const views = {
     dashboard: <Dashboard data={sdata} update={supdate} canEdit={canEdit} />,
@@ -3771,9 +4333,10 @@ export default function App() {
     employees: <EmployeesView data={sdata} update={supdate} canEdit={canEdit} currentUser={activeUser.name} />,
     suppliers: <SuppliersView data={sdata} update={supdate} canEdit={canEdit} />,
     inventory: <InventoryView data={sdata} update={supdate} canEdit={canEdit} currentUser={activeUser.name} />,
+    returns: <ReturnsView data={sdata} update={supdate} canEdit={canEdit} currentUser={activeUser.name} />,
     finance: <FinanceView data={sdata} update={supdate} canEdit={canEdit} currentUser={activeUser.name} />,
-    users: <UsersView data={data} update={update} canEdit={canEdit} currentUser={activeUser.name} />,
-    settings: <ShopSettingsView data={data} update={update} canEdit={canEdit} backupApi={backupApi} currentUser={activeUser.name} isAdmin={activeUser.role === "مدير عام"} />,
+    users: <UsersView data={data} update={update} canEdit={canEdit} currentUser={activeUser.name} isAdmin={isAdmin} />,
+    settings: <ShopSettingsView data={data} update={update} canEdit={canEdit} backupApi={backupApi} currentUser={activeUser.name} isAdmin={isAdmin} />,
     reports: <ReportsView data={sdata} />,
   };
 
