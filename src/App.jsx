@@ -28,9 +28,19 @@ const fmtNum = (n) => (Number(n) || 0).toLocaleString(undefined, { maximumFracti
 // Returns the new number plus the updated counters object to be saved together with the record.
 const nextCounter = (counters, key, start = 1000) => { const no = (Number(counters?.[key]) || start) + 1; return { no, counters: { ...(counters || {}), [key]: no } }; };
 // Builds a voucher with a purely numeric number (1001, 1002 ...) instead of a random id fragment.
-function buildVoucher(counters, fields, createdBy) {
-  const { no, counters: c } = nextCounter(counters, "voucher");
-  return { voucher: { id: uid("v"), voucherNo: no, createdAt: new Date().toISOString(), createdBy: createdBy || "", ...fields }, counters: c };
+// Numbers freed on purpose by the system admin (data.freedNumbers[key]) are handed out first, lowest first;
+// otherwise the counter goes up. A freed number that is somehow in use again is skipped.
+function issueNumber(data, counters, key, start, existing) {
+  const freedAll = data?.freedNumbers || {};
+  const used = new Set((existing || []).map((x) => Number(x)));
+  const pool = [...(freedAll[key] || [])].map(Number).filter((n) => n > 0 && !used.has(n)).sort((a, b) => a - b);
+  if (pool.length) return { no: pool[0], counters: counters || {}, freedNumbers: { ...freedAll, [key]: pool.slice(1) } };
+  const no = (Number(counters?.[key]) || start) + 1;
+  return { no, counters: { ...(counters || {}), [key]: no }, freedNumbers: { ...freedAll, [key]: [] } };
+}
+function buildVoucher(counters, fields, createdBy, data) {
+  const t = data ? issueNumber(data, counters, "voucher", 1000, (data.vouchers || []).map((v) => v.voucherNo)) : { ...nextCounter(counters, "voucher"), freedNumbers: undefined };
+  return { voucher: { id: uid("v"), voucherNo: t.no, createdAt: new Date().toISOString(), createdBy: createdBy || "", ...fields }, counters: t.counters, freedNumbers: t.freedNumbers };
 }
 // Numbers (orders, groups, customers, purchases, vouchers, journals, employee entries) only ever go UP.
 // Deleting an invoice/voucher never frees its number: counters are raised to the highest number that exists
@@ -122,11 +132,73 @@ function dedupeNumbers(d, cloud) {
   return { data: out, notes };
 }
 
+// A voucher is never deleted: cancelling keeps its number visible (status "cancelled"), reverses its effect on the
+// account balance, and every report/statement ignores cancelled vouchers.
+const liveVouchers = (data) => (data.vouchers || []).filter((v) => v.status !== "cancelled");
+function cancelVouchersWhere(data, predicate, reason, by) {
+  const targets = (data.vouchers || []).filter((v) => v.status !== "cancelled" && predicate(v));
+  const ids = new Set(targets.map((v) => v.id)); const delta = {};
+  targets.forEach((v) => { delta[v.accountId] = (delta[v.accountId] || 0) + (v.type === "قبض" ? -1 : 1) * (Number(v.amount) || 0); });
+  const at = new Date().toISOString();
+  return {
+    vouchers: data.vouchers.map((v) => ids.has(v.id) ? { ...v, status: "cancelled", cancelledAt: at, cancelledBy: by || "", cancelReason: reason } : v),
+    financeAccounts: data.financeAccounts.map((a) => delta[a.id] ? { ...a, balance: round2((Number(a.balance) || 0) + delta[a.id]) } : a),
+    count: targets.length,
+  };
+}
+// ---------- Branch permissions ----------
+// "مدير عام" always sees everything. Any other user who has branches assigned (المستخدمون ← الفروع المتاحة) only sees
+// the data of those branches. A user with no branches assigned keeps seeing everything (so old users are not locked out).
+function userBranchScope(data, user) {
+  if (!user || user.role === "مدير عام") return null;
+  const ids = (user.branches || []).filter((id) => data.branches.some((b) => b.id === id));
+  return ids.length ? ids : null;
+}
+const SCOPED_COLLECTIONS = ["orders", "orderGroups", "customers", "employees", "employeeLedger", "vouchers", "purchases", "appointments", "stockAdjustments"];
+const MASKED_KEYS = ["branches", "journalEntries"];   // hidden from restricted users; their writes are ignored
+function scopeData(data, allowed) {
+  if (!allowed) return data;
+  const A = new Set(allowed); const def = data.branches[0]?.id;
+  const orders = data.orders.filter((o) => A.has(o.branch));
+  const orderIds = new Set(orders.map((o) => o.id));
+  const custAny = new Set(data.orders.map((o) => o.customerId)), custIn = new Set(orders.map((o) => o.customerId));
+  const customers = data.customers.filter((c) => c.branch ? A.has(c.branch) : (custIn.has(c.id) || !custAny.has(c.id)));
+  const employees = data.employees.filter((e) => empBranches(data, e).some((id) => A.has(id)));
+  const empIds = new Set(employees.map((e) => e.id));
+  return {
+    ...data, _scope: allowed,
+    branches: data.branches.filter((b) => A.has(b.id)),
+    orders, customers, employees,
+    orderGroups: (data.orderGroups || []).filter((g) => data.orders.some((o) => o.groupId === g.id && A.has(o.branch))),
+    employeeLedger: (data.employeeLedger || []).filter((l) => empIds.has(l.employeeId)),
+    vouchers: data.vouchers.filter((v) => A.has(v.branch || def) || (v.orderId && orderIds.has(v.orderId))),
+    purchases: (data.purchases || []).filter((x) => A.has(x.branch || def)),
+    appointments: (data.appointments || []).filter((a) => !a.branch || A.has(a.branch)),
+    stockAdjustments: (data.stockAdjustments || []).filter((a) => A.has(a.branch || def)),
+    journalEntries: [],
+  };
+}
+// A restricted view only holds part of each list. Writing its arrays back verbatim would erase the hidden rest,
+// so changes are merged into the FULL lists: hidden records are kept, visible ones replaced/removed/added.
+function mergeScopedPatch(full, allowed, patch) {
+  const visible = scopeData(full, allowed); const out = { ...patch };
+  MASKED_KEYS.forEach((k) => delete out[k]);
+  SCOPED_COLLECTIONS.forEach((col) => {
+    if (!Array.isArray(patch[col])) return;
+    const fullList = full[col] || [];
+    const visibleIds = new Set((visible[col] || []).map((x) => x.id)), fullIds = new Set(fullList.map((x) => x.id));
+    const pm = new Map(patch[col].map((x) => [x.id, x])); const res = [];
+    fullList.forEach((x) => { if (!visibleIds.has(x.id)) res.push(x); else if (pm.has(x.id)) res.push(pm.get(x.id)); });
+    patch[col].forEach((x) => { if (!fullIds.has(x.id)) res.push(x); });
+    out[col] = res;
+  });
+  return out;
+}
 const PAYMENT_ACCOUNT_MAP = { "نقدي": "cash", "شبكة": "network", "تحويل بنكي": "bank" };
 const ROLE_STAGE_MAP = { "قصّاص": "القص", "خياط": "الخياطة", "كاوي": "الكي", "زرّار": "تركيب الأزرار" };
 const STAGE_ROLE_MAP = Object.fromEntries(Object.entries(ROLE_STAGE_MAP).map(([role, stage]) => [stage, role]));
 
-const ALL_MODULES = ["dashboard", "customers", "orders", "courier", "appointments", "designs", "invoices", "employees", "suppliers", "finance", "users", "settings", "reports"];
+const ALL_MODULES = ["dashboard", "customers", "orders", "courier", "appointments", "designs", "invoices", "employees", "suppliers", "inventory", "finance", "users", "settings", "reports"];
 const ROLES = ["مدير عام", "مدير فرع", "محاسب", "موظف استقبال"];
 
 function defaultPermissions(role) {
@@ -174,10 +246,11 @@ const seedData = () => ({
   counters: { customer: 1000, order: 1000, group: 1000, purchase: 1000, voucher: 1000, journal: 1000, empEntry: 5000 },
   employeeLedger: [],
   printSettings: { defaults: {}, customTemplates: [] },
+  inventoryItems: [], stockAdjustments: [], consumptionRules: [], freedNumbers: {},
   freedCustomerCodes: [],
   orderGroups: [],
   auditLog: [],
-  shopSettings: { name: "مشغل الخياطة الرجالية", legalName: "", logo: "", phone: "", whatsapp: "", address: "", city: "", crNumber: "", taxNumber: "", website: "", bankName: "", iban: "", invoiceFooter: "", appTheme: "classic", readyMessageTemplate: "مرحبًا {name}، طلبك رقم #{orderNo} جاهز للاستلام من {shop}. بانتظارك! 🙏\nتقدر تتابع حالة طلبك من هنا: {trackLink}", thankYouMessageTemplate: "شكرًا لك {name} على ثقتك بنا! يسعدنا تقييم تجربتك: {reviewLink}", reminderMessageTemplate: "تذكير: عندك موعد بـ{shop} بتاريخ {date} الساعة {time}. بانتظارك! 🙏", reviewLink: "" },
+  shopSettings: { name: "مشغل الخياطة الرجالية", legalName: "", logo: "", phone: "", whatsapp: "", address: "", city: "", crNumber: "", taxNumber: "", website: "", bankName: "", iban: "", invoiceFooter: "", appTheme: "classic", readyMessageTemplate: "مرحبًا {name}، طلبك رقم #{orderNo} جاهز للاستلام من {shop}. بانتظارك! 🙏\nتقدر تتابع حالة طلبك من هنا: {trackLink}", thankYouMessageTemplate: "شكرًا لك {name} على ثقتك بنا! يسعدنا تقييم تجربتك: {reviewLink}", reminderMessageTemplate: "تذكير: عندك موعد بـ{shop} بتاريخ {date} الساعة {time}. بانتظارك! 🙏", reviewLink: "", ...WA_NEW_DEFAULTS },
   fabricThresholds: {},
   users: [{ id: "u1", name: "مدير النظام", username: "admin", password: "admin123", phone: "", role: "مدير عام", branches: ["b1"], permissions: defaultPermissions("مدير عام") }],
   invoiceTheme: "classic",
@@ -243,8 +316,7 @@ function buildWhatsAppLink(phone, message) {
 }
 function WhatsAppNotifyButton({ order, data, update, custPhone, custName, templateField = "readyMessageTemplate", trackField = "notifiedAt", buttonLabel = "📱 إرسال إشعار واتساب للعميل", sentLabel = "آخر إشعار مُرسل" }) {
   if (!custPhone) return <div style={{ fontSize: 12, color: "#8A8071" }}>لا يوجد رقم جوال مسجّل لهذا العميل لإرسال الإشعار.</div>;
-  const trackLink = `${window.location.origin}${window.location.pathname}?track=${order.orderNo || order.id.slice(-6)}`;
-  const message = fillTemplate(data.shopSettings?.[templateField], { name: custName, orderNo: order.orderNo || order.id.slice(-6), shop: data.shopSettings?.name || "", trackLink, reviewLink: data.shopSettings?.reviewLink || "" });
+  const message = fillTemplate(data.shopSettings?.[templateField] ?? WA_NEW_DEFAULTS[templateField], waVars(data, order, custName));
   const send = () => {
     window.open(buildWhatsAppLink(custPhone, message), "_blank");
     update({ orders: data.orders.map((o) => o.id === order.id ? { ...o, [trackField]: new Date().toLocaleString("ar-SA") } : o) });
@@ -537,7 +609,7 @@ function PrintSheet({ data, tpl, preview, title, docNo, docNoLabel = "رقم", d
   );
   return (
     <div className={preview ? "" : "printable"} style={{ width: preview ? "794px" : "210mm", minHeight: preview ? "1123px" : "297mm", background: "#fff", color: "#211D19", boxSizing: "border-box", padding: "10mm", margin: "0 auto", position: "relative", fontFamily: body, display: "flex", flexDirection: "column", boxShadow: preview ? "none" : "0 2px 10px rgba(0,0,0,.18)", overflow: "hidden" }}>
-      {t.watermark && <div style={{ position: "absolute", top: "42%", left: 0, right: 0, textAlign: "center", fontSize: 96, fontWeight: 700, color: A, opacity: 0.06, transform: "rotate(-28deg)", pointerEvents: "none", fontFamily: head }}>{t.watermark}</div>}
+      {t.watermark && <div style={{ position: "absolute", top: "42%", left: 0, right: 0, textAlign: "center", fontSize: 96, fontWeight: 700, color: t.watermarkColor || A, opacity: t.watermarkOpacity || 0.06, transform: "rotate(-28deg)", pointerEvents: "none", fontFamily: head }}>{t.watermark}</div>}
       <div style={{ flex: 1, display: "flex", flexDirection: "column", ...frameStyle }}>
         {header}
         {meta && meta.length > 0 && (
@@ -596,9 +668,9 @@ function PrintStage({ data, docType, tplId, setTplId, children, extraControls })
   );
 }
 
-function RecordPrintModal({ data, title, refLabel, refNo, rows, attachment, onClose, partyTitle, partyRows, signatures, docType = "voucher", amount, date }) {
+function RecordPrintModal({ data, title, refLabel, refNo, rows, attachment, onClose, partyTitle, partyRows, signatures, docType = "voucher", amount, date, cancelled }) {
   const [tplId, setTplId] = useState(null);
-  const tpl = resolveTpl(data, docType, tplId);
+  const tpl = { ...resolveTpl(data, docType, tplId), ...(cancelled ? { watermark: "ملغى", watermarkColor: "#B3261E", watermarkOpacity: 0.16 } : {}) };
   return (
     <Modal title={title} onClose={onClose} width={900}>
       <PrintStage data={data} docType={docType} tplId={tplId} setTplId={setTplId}>
@@ -647,7 +719,7 @@ function VoucherPrintModal({ data, voucher, onClose }) {
   const created = voucher.createdAt ? new Date(voucher.createdAt).toLocaleTimeString("ar-SA", { hour: "2-digit", minute: "2-digit" }) : "";
   return (
     <RecordPrintModal data={data} title={title} refLabel={title} refNo={voucher.voucherNo || voucher.id.slice(-6)} attachment={voucher.attachment} onClose={onClose}
-      docType="voucher" date={`${voucher.date || "—"}${created ? " — " + created : ""}`} amount={Number(voucher.amount) || 0}
+      docType="voucher" cancelled={voucher.status === "cancelled"} date={`${voucher.date || "—"}${created ? " — " + created : ""}`} amount={Number(voucher.amount) || 0}
       partyTitle={isReceipt ? "بيانات الدافع (المقبوض منه)" : "بيانات المستلم (المصروف له)"}
       partyRows={partyRows.length ? partyRows : [{ label: isReceipt ? "المقبوض منه" : "المستلم", value: "غير محدد" }]}
       signatures={isReceipt ? ["توقيع الدافع", "توقيع المحاسب / أمين الصندوق"] : ["توقيع المستلم", "توقيع المحاسب / أمين الصندوق"]}
@@ -657,6 +729,7 @@ function VoucherPrintModal({ data, voucher, onClose }) {
         { label: "التصنيف", value: voucher.category || "—" },
         { label: "البيان", value: voucher.description || "—" },
         ...(voucher.createdBy ? [{ label: "أنشأه", value: voucher.createdBy }] : []),
+        ...(voucher.status === "cancelled" ? [{ label: "الحالة", value: "ملغى" }, { label: "سبب الإلغاء", value: voucher.cancelReason || "—" }, { label: "ألغاه", value: `${voucher.cancelledBy || "—"} — ${voucher.cancelledAt ? new Date(voucher.cancelledAt).toLocaleDateString("ar-SA") : ""}` }] : []),
       ]} />
   );
 }
@@ -774,7 +847,7 @@ function StatementView({ data, title, partyLines, rows, opening = 0, labels, onC
   const inRange = (r) => (!from || (r.date || "") >= from) && (!to || (r.date || "") <= to);
   const sum = (arr, k) => round2(arr.reduce((t, r) => t + (Number(r[k]) || 0), 0));
   const base = branch ? forBranch(branch) : rows;
-  const open = branch ? 0 : (Number(opening) || 0);
+  const open = (branch || data._scope) ? 0 : (Number(opening) || 0);
   let run = open;
   const withRun = base.map((r) => { run += r.inc - r.dec; return { ...r, running: round2(run) }; });
   const carried = from ? (withRun.filter((r) => (r.date || "") < from).slice(-1)[0]?.running ?? open) : open;
@@ -965,8 +1038,344 @@ function PrintTemplatesPanel({ data, update }) {
   );
 }
 
+// ---------- Inventory (stock of fabrics, buttons, thread, lining ... per branch) ----------
+// Stock is DERIVED, never stored: purchases (+) − order consumption (−, cancelled orders excluded) ± manual adjustments.
+// So it can't drift or conflict between devices. Items are matched to purchases by name.
+const INV_CATEGORIES = ["قماش", "أزرار", "خيوط", "بطانة", "أخرى"];
+const normName = (x) => String(x || "").trim().toLowerCase();
+function inventoryMovements(data) {
+  const def = data.branches[0]?.id;
+  const byName = new Map((data.inventoryItems || []).map((i) => [normName(i.name), i]));
+  const mv = [];
+  (data.purchases || []).forEach((p) => {
+    const it = byName.get(normName(p.item));
+    if (it && Number(p.qty) > 0) mv.push({ id: p.id, itemId: it.id, branch: p.branch || def, qty: Number(p.qty), kind: "شراء", date: p.date || "", ref: `شراء #${p.purchaseNo || ""}` });
+  });
+  (data.orders || []).filter((o) => !o.cancelled).forEach((o) => {
+    const fab = o.fabricType && Number(o.fabricUsed) > 0 ? byName.get(normName(o.fabricType)) : null;
+    if (fab) mv.push({ id: `${o.id}:f`, itemId: fab.id, branch: o.branch || def, qty: -Number(o.fabricUsed), kind: "استهلاك طلب", date: o.createdAt || "", ref: `طلب #${o.orderNo || ""} (قماش)` });
+    (o.materials || []).forEach((m, i) => {
+      if (m.itemId && Number(m.qty) > 0 && !(fab && m.itemId === fab.id)) mv.push({ id: `${o.id}:m${i}`, itemId: m.itemId, branch: o.branch || def, qty: -Number(m.qty), kind: "استهلاك طلب", date: o.createdAt || "", ref: `طلب #${o.orderNo || ""}` });
+    });
+  });
+  (data.stockAdjustments || []).forEach((a) => mv.push({ id: a.id, itemId: a.itemId, branch: a.branch || def, qty: Number(a.qty) || 0, kind: a.kind, date: a.date || "", ref: a.reason || "" }));
+  return mv;
+}
+function stockLevels(data, branchId) {
+  const out = {}; (data.inventoryItems || []).forEach((i) => { out[i.id] = 0; });
+  inventoryMovements(data).forEach((m) => { if (branchId && m.branch !== branchId) return; out[m.itemId] = round2((out[m.itemId] || 0) + m.qty); });
+  return out;
+}
+// Items at or below their minimum, evaluated per branch (only branches that ever moved the item).
+function lowStockList(data) {
+  const mv = inventoryMovements(data); const res = [];
+  (data.inventoryItems || []).forEach((it) => {
+    const min = Number(it.minQty) || 0; if (min <= 0) return;
+    const per = {}; mv.filter((m) => m.itemId === it.id).forEach((m) => { per[m.branch] = round2((per[m.branch] || 0) + m.qty); });
+    Object.keys(per).forEach((b) => { if (per[b] <= min) res.push({ item: it, branch: b, qty: per[b], branchName: data.branches.find((x) => x.id === b)?.name || "" }); });
+  });
+  return res;
+}
+const materialsFromRules = (data, orderType) => (data.consumptionRules || []).filter((r) => r.orderType === orderType && Number(r.qty) > 0).map((r) => ({ itemId: r.itemId, qty: Number(r.qty) }));
+
+function InventoryView({ data, update, canEdit, currentUser }) {
+  const [branch, setBranch] = useState("");
+  const [itemModal, setItemModal] = useState(null);
+  const [adjModal, setAdjModal] = useState(null);
+  const [historyFor, setHistoryFor] = useState(null);
+  const [rulesOpen, setRulesOpen] = useState(false);
+  const [ruleType, setRuleType] = useState(data.orderTypes[0] || "");
+  const [ruleNew, setRuleNew] = useState({ itemId: "", qty: "" });
+  const items = data.inventoryItems || [];
+  const levels = stockLevels(data, branch);
+  const low = lowStockList(data).filter((x) => !branch || x.branch === branch);
+  const mv = inventoryMovements(data);
+  const bName = (id) => data.branches.find((b) => b.id === id)?.name || "—";
+  const itemName = (id) => items.find((i) => i.id === id)?.name || "—";
+  const th = { padding: "8px 10px", textAlign: "right" };
+
+  const saveItem = () => {
+    const v = itemModal.values;
+    if (!String(v.name || "").trim()) { alert("أدخل اسم الصنف"); return; }
+    if (items.some((i) => i.id !== v.id && normName(i.name) === normName(v.name))) { alert("يوجد صنف بنفس الاسم"); return; }
+    const clean = { ...v, name: v.name.trim(), minQty: Number(v.minQty) || 0 };
+    update({ inventoryItems: itemModal.mode === "add" ? [...items, { id: uid("inv"), ...clean }] : items.map((i) => i.id === clean.id ? clean : i) });
+    setItemModal(null);
+  };
+  const deleteItem = (it) => {
+    if (mv.some((m) => m.itemId === it.id) || (data.consumptionRules || []).some((r) => r.itemId === it.id)) { alert("لا يمكن حذف صنف له حركات أو قواعد استهلاك. اجعل حده الأدنى 0 بدل حذفه."); return; }
+    if (!window.confirm(`حذف الصنف «${it.name}»؟`)) return;
+    update({ inventoryItems: items.filter((i) => i.id !== it.id) });
+  };
+  const saveAdjustment = () => {
+    const { item, values } = adjModal; const q = Number(values.qty);
+    if (!values.branch) { alert("اختر الفرع"); return; }
+    if (values.kind !== "جرد" && (!q || q <= 0)) { alert("أدخل كمية صحيحة"); return; }
+    if (values.kind === "جرد" && (values.qty === "" || isNaN(q) || q < 0)) { alert("أدخل الكمية الفعلية الموجودة"); return; }
+    const base = { itemId: item.id, date: values.date || todayStr(), by: currentUser, reason: values.reason || "" };
+    const now = stockLevels(data, values.branch)[item.id] || 0;
+    let adds = [];
+    if (values.kind === "جرد") { const diff = round2(q - now); if (!diff) { setAdjModal(null); return; } adds = [{ ...base, id: uid("adj"), branch: values.branch, qty: diff, kind: "جرد" }]; }
+    else if (values.kind === "تالف / فاقد") adds = [{ ...base, id: uid("adj"), branch: values.branch, qty: -q, kind: "تالف / فاقد" }];
+    else if (values.kind === "إضافة يدوية") adds = [{ ...base, id: uid("adj"), branch: values.branch, qty: q, kind: "إضافة يدوية" }];
+    else if (values.kind === "نقل لفرع آخر") {
+      if (!values.toBranch || values.toBranch === values.branch) { alert("اختر فرعًا مختلفًا للنقل"); return; }
+      if (q > now) { alert(`الكمية المتاحة في الفرع (${fmtNum(now)}) أقل من المطلوب نقلها`); return; }
+      const ref = `نقل من ${bName(values.branch)} إلى ${bName(values.toBranch)}`;
+      adds = [{ ...base, id: uid("adj"), branch: values.branch, qty: -q, kind: "نقل صادر", reason: ref }, { ...base, id: uid("adj"), branch: values.toBranch, qty: q, kind: "نقل وارد", reason: ref }];
+    }
+    update({ stockAdjustments: [...(data.stockAdjustments || []), ...adds] });
+    setAdjModal(null);
+  };
+  const addRule = () => {
+    if (!ruleNew.itemId || !(Number(ruleNew.qty) > 0)) { alert("اختر الصنف وأدخل كمية أكبر من صفر"); return; }
+    update({ consumptionRules: [...(data.consumptionRules || []), { id: uid("rule"), orderType: ruleType, itemId: ruleNew.itemId, qty: Number(ruleNew.qty) }] });
+    setRuleNew({ itemId: "", qty: "" });
+  };
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 14 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}><Package size={22} color={THEME.brass} /><h2 style={{ margin: 0, fontFamily: "Amiri, serif", fontSize: 26 }}>المخزون</h2></div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          {data.branches.length > 1 && <div style={{ width: 190 }}><SelectInput options={[{ value: "", label: "كل الفروع" }, ...data.branches.map((b) => ({ value: b.id, label: b.name }))]} value={branch} onChange={(e) => setBranch(e.target.value)} /></div>}
+          <Btn variant="ghost" onClick={() => setRulesOpen(true)}>قواعد الاستهلاك التلقائي</Btn>
+          {canEdit && <Btn variant="brass" onClick={() => setItemModal({ mode: "add", values: { category: INV_CATEGORIES[0], minQty: 0 } })}><Plus size={16} />صنف جديد</Btn>}
+        </div>
+      </div>
+
+      {low.length > 0 && (
+        <div style={{ background: `${THEME.red}12`, border: `1px solid ${THEME.red}`, borderRadius: 8, padding: 12, fontSize: 13.5, marginBottom: 14 }}>
+          <b style={{ color: THEME.red }}>⚠ أصناف وصلت للحد الأدنى:</b> {low.map((x) => `${x.item.name} (${fmtNum(x.qty)} ${x.item.unit || ""}${data.branches.length > 1 ? ` — ${x.branchName}` : ""})`).join("، ")}
+        </div>
+      )}
+
+      <Panel>
+        {items.length === 0 ? <EmptyState text="لا توجد أصناف بعد. تُضاف الأصناف تلقائيًا عند تسجيل مشتريات، أو أضفها يدويًا." /> : (
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13.5 }}>
+              <thead><tr style={{ background: "#EFE7D6" }}><th style={th}>الصنف</th><th style={th}>التصنيف</th><th style={th}>المتاح{branch ? ` (${bName(branch)})` : ""}</th><th style={th}>الحد الأدنى</th><th style={th}>الحالة</th><th style={th}></th></tr></thead>
+              <tbody>
+                {items.map((it) => {
+                  const q = levels[it.id] || 0; const min = Number(it.minQty) || 0;
+                  const state = q <= 0 ? ["نفد", THEME.red] : (min > 0 && q <= min) ? ["منخفض", "#C77700"] : ["كافٍ", THEME.teal];
+                  return (
+                    <tr key={it.id} style={{ borderTop: `1px solid ${THEME.border}` }}>
+                      <td style={{ padding: "8px 10px", fontWeight: 600 }}>{it.name}</td>
+                      <td style={{ padding: "8px 10px" }}>{it.category}</td>
+                      <td style={{ padding: "8px 10px", fontWeight: 700 }}>{fmtNum(q)} {it.unit}</td>
+                      <td style={{ padding: "8px 10px" }}>{min ? `${fmtNum(min)} ${it.unit || ""}` : "—"}</td>
+                      <td style={{ padding: "8px 10px" }}><Badge color={state[1]}>{state[0]}</Badge></td>
+                      <td style={{ padding: "8px 10px", whiteSpace: "nowrap" }}>
+                        <div style={{ display: "flex", gap: 5, justifyContent: "flex-end" }}>
+                          <Btn small variant="ghost" onClick={() => setHistoryFor(it)}>الحركات</Btn>
+                          {canEdit && <Btn small variant="ghost" onClick={() => setAdjModal({ item: it, values: { kind: "جرد", branch: branch || data.branches[0]?.id, date: todayStr(), qty: "", reason: "" } })}>جرد / تسوية</Btn>}
+                          {canEdit && <Btn small variant="ghost" onClick={() => setItemModal({ mode: "edit", values: it })}><Pencil size={13} /></Btn>}
+                          {canEdit && <Btn small variant="danger" onClick={() => deleteItem(it)}><Trash2 size={13} /></Btn>}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </Panel>
+      <div style={{ fontSize: 12, color: "#8A8071", marginTop: 10 }}>المتاح = المشتريات − استهلاك الطلبات (غير الملغاة) ± التسويات. إلغاء طلب يُرجع ما استهلكه تلقائيًا. القماش يُخصم من «نوع القماش» و«الكمية المستخدمة» في الطلب، وبقية المواد من قواعد الاستهلاك.</div>
+
+      {itemModal && (
+        <Modal title={itemModal.mode === "add" ? "صنف جديد" : "تعديل الصنف"} onClose={() => setItemModal(null)}>
+          <FormFields values={itemModal.values} setValues={(v) => setItemModal({ ...itemModal, values: v })} fields={[
+            { key: "name", label: "اسم الصنف (نفس الاسم المستخدم في المشتريات والطلبات)" },
+            { key: "category", label: "التصنيف", type: "select", options: INV_CATEGORIES.map((c) => ({ value: c, label: c })) },
+            { key: "unit", label: "الوحدة (متر، قطعة، بكرة…)" },
+            { key: "minQty", label: "الحد الأدنى للتنبيه", type: "number" },
+          ]} />
+          {itemModal.mode === "edit" && <div style={{ fontSize: 11.5, color: "#8A8071", marginBottom: 8 }}>تنبيه: إن غيّرت الاسم فلن تُحسب المشتريات والطلبات المسجّلة بالاسم القديم.</div>}
+          <div style={{ display: "flex", gap: 8 }}><Btn variant="brass" onClick={saveItem}>حفظ</Btn><Btn variant="ghost" onClick={() => setItemModal(null)}>إلغاء</Btn></div>
+        </Modal>
+      )}
+
+      {adjModal && (
+        <Modal title={`جرد / تسوية — ${adjModal.item.name}`} onClose={() => setAdjModal(null)}>
+          <FormFields values={adjModal.values} setValues={(v) => setAdjModal({ ...adjModal, values: v })} fields={[
+            { key: "kind", label: "نوع العملية", type: "select", options: ["جرد", "تالف / فاقد", "إضافة يدوية", "نقل لفرع آخر"].map((k) => ({ value: k, label: k === "جرد" ? "جرد (أدخل الكمية الفعلية الموجودة)" : k })) },
+            { key: "branch", label: adjModal.values.kind === "نقل لفرع آخر" ? "من فرع" : "الفرع", type: "select", options: data.branches.map((b) => ({ value: b.id, label: b.name })) },
+            ...(adjModal.values.kind === "نقل لفرع آخر" ? [{ key: "toBranch", label: "إلى فرع", type: "select", options: [{ value: "", label: "— اختر —" }, ...data.branches.filter((b) => b.id !== adjModal.values.branch).map((b) => ({ value: b.id, label: b.name }))] }] : []),
+            { key: "qty", label: adjModal.values.kind === "جرد" ? `الكمية الفعلية (${adjModal.item.unit || "وحدة"})` : `الكمية (${adjModal.item.unit || "وحدة"})`, type: "number" },
+            { key: "date", label: "التاريخ", type: "date" }, { key: "reason", label: "السبب / ملاحظة" },
+          ]} />
+          <div style={{ fontSize: 12.5, color: "#7A7061", marginBottom: 10 }}>المتاح الآن في الفرع المختار: <b>{fmtNum(stockLevels(data, adjModal.values.branch)[adjModal.item.id] || 0)} {adjModal.item.unit}</b></div>
+          <div style={{ display: "flex", gap: 8 }}><Btn variant="brass" onClick={saveAdjustment}>حفظ</Btn><Btn variant="ghost" onClick={() => setAdjModal(null)}>إلغاء</Btn></div>
+        </Modal>
+      )}
+
+      {historyFor && (
+        <Modal title={`حركات الصنف — ${historyFor.name}`} onClose={() => setHistoryFor(null)} wide>
+          {(() => {
+            const rows = mv.filter((m) => m.itemId === historyFor.id && (!branch || m.branch === branch)).sort((a, b) => String(b.date).localeCompare(String(a.date)));
+            return rows.length === 0 ? <EmptyState text="لا توجد حركات" /> : (
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+                <thead><tr style={{ background: "#EFE7D6" }}><th style={th}>التاريخ</th><th style={th}>الحركة</th><th style={th}>الفرع</th><th style={th}>المرجع</th><th style={th}>الكمية</th></tr></thead>
+                <tbody>{rows.map((m) => <tr key={m.id} style={{ borderTop: `1px solid ${THEME.border}` }}><td style={{ padding: "6px 10px" }}>{String(m.date).slice(0, 10)}</td><td style={{ padding: "6px 10px" }}>{m.kind}</td><td style={{ padding: "6px 10px" }}>{bName(m.branch)}</td><td style={{ padding: "6px 10px" }}>{m.ref}</td><td style={{ padding: "6px 10px", fontWeight: 700, color: m.qty < 0 ? THEME.red : THEME.teal }} dir="ltr">{m.qty > 0 ? "+" : ""}{fmtNum(m.qty)}</td></tr>)}</tbody>
+              </table>
+            );
+          })()}
+        </Modal>
+      )}
+
+      {rulesOpen && (
+        <Modal title="قواعد الاستهلاك التلقائي" onClose={() => setRulesOpen(false)} wide>
+          <div style={{ fontSize: 12.5, color: "#7A7061", marginBottom: 10 }}>حدّد لكل نوع خياطة المواد التي يستهلكها الطلب الواحد (غير القماش). عند إنشاء طلب جديد تُنسخ هذه الكميات إلى الطلب وتُخصم من المخزون تلقائيًا. تغيير القاعدة لاحقًا لا يغيّر الطلبات السابقة.</div>
+          <Field label="نوع الخياطة"><SelectInput options={data.orderTypes.map((t) => ({ value: t, label: t }))} value={ruleType} onChange={(e) => setRuleType(e.target.value)} /></Field>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13.5, marginBottom: 10 }}>
+            <tbody>
+              {(data.consumptionRules || []).filter((r) => r.orderType === ruleType).map((r) => (
+                <tr key={r.id} style={{ borderTop: `1px solid ${THEME.border}` }}>
+                  <td style={{ padding: "7px 10px", fontWeight: 600 }}>{itemName(r.itemId)}</td>
+                  <td style={{ padding: "7px 10px" }}>{fmtNum(r.qty)} {items.find((i) => i.id === r.itemId)?.unit}</td>
+                  <td style={{ padding: "7px 10px", textAlign: "left" }}>{canEdit && <Btn small variant="danger" onClick={() => update({ consumptionRules: data.consumptionRules.filter((x) => x.id !== r.id) })}><Trash2 size={13} /></Btn>}</td>
+                </tr>
+              ))}
+              {!(data.consumptionRules || []).some((r) => r.orderType === ruleType) && <tr><td style={{ padding: 12, color: "#8A8071" }}>لا توجد قواعد لهذا النوع</td></tr>}
+            </tbody>
+          </table>
+          {canEdit && (
+            <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr auto", gap: 8, alignItems: "end" }}>
+              <Field label="الصنف"><SelectInput options={[{ value: "", label: "— اختر —" }, ...items.filter((i) => i.category !== "قماش").map((i) => ({ value: i.id, label: `${i.name} (${i.unit || "وحدة"})` }))]} value={ruleNew.itemId} onChange={(e) => setRuleNew({ ...ruleNew, itemId: e.target.value })} /></Field>
+              <Field label="الكمية لكل طلب"><TextInput type="number" value={ruleNew.qty} onChange={(e) => setRuleNew({ ...ruleNew, qty: e.target.value })} /></Field>
+              <Btn variant="brass" onClick={addRule} style={{ marginBottom: 12 }}><Plus size={14} />إضافة</Btn>
+            </div>
+          )}
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+// ---------- WhatsApp alert centre (free: opens wa.me with the message pre-filled; sending stays one tap) ----------
+const WA_NEW_DEFAULTS = {
+  delayMessageTemplate: "مرحبًا {name}، نعتذر عن تأخر طلبك رقم #{orderNo} عن الموعد ({deliveryDate}). نعمل على إنهائه بأسرع وقت وسنوافيك فور جاهزيته.\nتابع حالة طلبك: {trackLink}",
+  balanceMessageTemplate: "مرحبًا {name}، نذكّرك بأن المتبقي على طلبك رقم #{orderNo} هو {balance} ر.س. بانتظارك في {shop} 🙏",
+};
+const orderBalance = (o) => Math.max(0, round2((Number(o.price) || 0) - (Number(o.discount) || 0) - (Number(o.deposit) || 0)));
+function waVars(data, order, name) {
+  const no = order.orderNo || String(order.id || "").slice(-6);
+  const base = typeof window !== "undefined" ? `${window.location.origin}${window.location.pathname}` : "";
+  return { name, orderNo: no, shop: data.shopSettings?.name || "", trackLink: `${base}?track=${no}`, reviewLink: data.shopSettings?.reviewLink || "", balance: fmtNum(orderBalance(order)), deliveryDate: order.deliveryDate || "" };
+}
+const WA_TYPES = {
+  ready: { label: "جاهز للاستلام", icon: "🎉", templateField: "readyMessageTemplate", field: "notifiedAt", locale: true },
+  delay: { label: "اعتذار عن تأخير", icon: "⏰", templateField: "delayMessageTemplate", field: "delayNotifiedAt" },
+  balance: { label: "تذكير بمبلغ متبقٍ", icon: "💰", templateField: "balanceMessageTemplate", field: "balanceNotifiedAt" },
+  thanks: { label: "شكر وطلب تقييم", icon: "🙏", templateField: "thankYouMessageTemplate", field: "thankedAt", locale: true },
+  appointment: { label: "تذكير بموعد", icon: "📅", templateField: "reminderMessageTemplate", field: "remindedAt" },
+};
+// What is worth sending today. Nothing is ever sent automatically — the person taps each message.
+function waPending(data) {
+  const today = todayStr(); const tomorrow = new Date(Date.now() + 86400000).toISOString().slice(0, 10);
+  const daysAgo = (n) => new Date(Date.now() - n * 86400000).toISOString().slice(0, 10);
+  const cust = (id) => data.customers.find((c) => c.id === id);
+  const out = [];
+  (data.orders || []).filter((o) => !o.cancelled).forEach((o) => {
+    const c = cust(o.customerId); const skipped = o.waSkipped || {};
+    const add = (type, detail) => { if (!skipped[type]) out.push({ key: `${type}:${o.id}`, type, order: o, customer: c, detail }); };
+    const recent = (o.createdAt || "") >= daysAgo(45);
+    if (o.stage === "جاهز للتسليم" && !o.notifiedAt) add("ready", "");
+    if (o.stage !== "جاهز للتسليم" && o.stage !== "تم التسليم" && o.deliveryDate && o.deliveryDate < today && !o.delayNotifiedAt) add("delay", `الموعد كان ${o.deliveryDate}`);
+    const bal = orderBalance(o);
+    const lastBal = o.balanceNotifiedAt ? new Date(o.balanceNotifiedAt).getTime() : 0;
+    if (bal > 0 && (o.stage === "جاهز للتسليم" || (o.stage === "تم التسليم" && recent)) && Date.now() - lastBal > 3 * 86400000) add("balance", `المتبقي ${fmtNum(bal)} ر.س`);
+    if (o.stage === "تم التسليم" && recent && !o.thankedAt) add("thanks", "");
+  });
+  (data.appointments || []).filter((a) => a.status === "مجدول" && (a.date === today || a.date === tomorrow) && !a.remindedAt).forEach((a) => out.push({ key: `appointment:${a.id}`, type: "appointment", apt: a, customer: cust(a.customerId), detail: `${a.date} ${a.time || ""}` }));
+  return out;
+}
+function WhatsAppCenter({ data, update, canEdit, onClose }) {
+  const [, force] = useState(0);
+  const items = waPending(data);
+  const send = (it) => {
+    const t = WA_TYPES[it.type]; const name = it.customer?.name || "";
+    const message = it.type === "appointment"
+      ? fillTemplate(data.shopSettings?.[t.templateField], { name, date: it.apt.date, time: it.apt.time, shop: data.shopSettings?.name || "" })
+      : fillTemplate(data.shopSettings?.[t.templateField] ?? WA_NEW_DEFAULTS[t.templateField], waVars(data, it.order, name));
+    window.open(buildWhatsAppLink(it.customer.phone, message), "_blank");
+    const stamp = t.locale ? new Date().toLocaleString("ar-SA") : new Date().toISOString();
+    if (it.type === "appointment") update({ appointments: data.appointments.map((a) => a.id === it.apt.id ? { ...a, [t.field]: stamp } : a) });
+    else update({ orders: data.orders.map((o) => o.id === it.order.id ? { ...o, [t.field]: stamp } : o) });
+    force((n) => n + 1);
+  };
+  const skip = (it) => {
+    if (it.type === "appointment") update({ appointments: data.appointments.map((a) => a.id === it.apt.id ? { ...a, remindedAt: "تم التجاهل" } : a) });
+    else update({ orders: data.orders.map((o) => o.id === it.order.id ? { ...o, waSkipped: { ...(o.waSkipped || {}), [it.type]: new Date().toISOString() } } : o) });
+  };
+  const groups = Object.keys(WA_TYPES).map((k) => [k, items.filter((x) => x.type === k)]).filter(([, l]) => l.length);
+  return (
+    <Modal title="رسائل واتساب المقترحة" onClose={onClose} wide>
+      <div style={{ fontSize: 12.5, color: "#7A7061", marginBottom: 12 }}>لا يُرسل النظام أي رسالة بنفسه: الضغط على «إرسال» يفتح واتساب برسالة جاهزة تضغط إرسال فيها. بعدها يُسجَّل الإرسال ويختفي من القائمة. «تجاهل» يخفيها دون إرسال.</div>
+      {groups.length === 0 ? <EmptyState text="لا توجد رسائل مقترحة الآن ✓" /> : groups.map(([k, list]) => (
+        <div key={k} style={{ marginBottom: 16 }}>
+          <div style={{ fontWeight: 700, marginBottom: 6 }}>{WA_TYPES[k].icon} {WA_TYPES[k].label} <Badge color={THEME.teal}>{list.length}</Badge></div>
+          {list.map((it) => (
+            <div key={it.key} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, padding: "7px 10px", borderBottom: `1px dashed ${THEME.border}`, fontSize: 13.5 }}>
+              <span><b>{it.customer?.name || "—"}</b>{it.order ? ` — طلب #${it.order.orderNo || ""}` : ""}{it.detail ? ` — ${it.detail}` : ""}{!it.customer?.phone && <span style={{ color: THEME.red }}> (لا يوجد جوال)</span>}</span>
+              {canEdit && <span style={{ display: "flex", gap: 6 }}>
+                <Btn small variant="brass" onClick={() => it.customer?.phone ? send(it) : alert("لا يوجد رقم جوال لهذا العميل")}>إرسال واتساب</Btn>
+                <Btn small variant="ghost" onClick={() => skip(it)}>تجاهل</Btn>
+              </span>}
+            </div>
+          ))}
+        </div>
+      ))}
+    </Modal>
+  );
+}
+
+// Permanent deletion is reserved for the system admin ("مدير عام"). The admin may also hand the deleted document's
+// number back so the next new document reuses it (refill); otherwise the number stays retired.
+function AdminDeleteModal({ title, lines, numberLabel, number, onConfirm, onClose }) {
+  const [free, setFree] = useState(false);
+  return (
+    <Modal title={title} onClose={onClose}>
+      <div style={{ background: `${THEME.red}12`, border: `1px solid ${THEME.red}`, borderRadius: 8, padding: 12, fontSize: 13.5, marginBottom: 12 }}>
+        <b style={{ color: THEME.red }}>حذف نهائي لا يمكن التراجع عنه.</b>
+        {(lines || []).map((l, i) => <div key={i} style={{ marginTop: 4 }}>{l}</div>)}
+      </div>
+      {number !== undefined && number !== null && number !== "" && (
+        <label style={{ display: "flex", gap: 8, alignItems: "flex-start", fontSize: 13.5, marginBottom: 14 }}>
+          <input type="checkbox" checked={free} onChange={(e) => setFree(e.target.checked)} style={{ marginTop: 4 }} />
+          <span>إتاحة {numberLabel} <b>{number}</b> لإعادة الاستخدام: يأخذه أول مستند جديد من نفس النوع (تعبئة الرقم المحذوف). وإن تركتها فارغة يبقى الرقم محذوفًا ولا يتكرر.</span>
+        </label>
+      )}
+      <div style={{ display: "flex", gap: 8 }}><Btn variant="danger" onClick={() => onConfirm(free)}>تأكيد الحذف النهائي</Btn><Btn variant="ghost" onClick={onClose}>تراجع</Btn></div>
+    </Modal>
+  );
+}
+const withFreed = (data, key, no, free) => (free && no ? { freedNumbers: { ...(data.freedNumbers || {}), [key]: [...new Set([...((data.freedNumbers || {})[key] || []), Number(no)])].sort((a, b) => a - b) } } : {});
+
+function FreedNumbersPanel({ data, update }) {
+  const labels = { order: "أرقام الطلبات / الفواتير", group: "أرقام الطلبيات", voucher: "أرقام السندات", purchase: "أرقام المشتريات", customer: "أكواد العملاء" };
+  const fn = data.freedNumbers || {};
+  const keys = Object.keys(labels).filter((k) => (fn[k] || []).length);
+  return (
+    <Panel style={{ marginTop: 20 }}>
+      <div style={{ fontWeight: 700, fontSize: 16, marginBottom: 4 }}>الأرقام الشاغرة المتاحة لإعادة الاستخدام</div>
+      <div style={{ fontSize: 12.5, color: "#7A7061", marginBottom: 10 }}>أرقام أتحتَها عند الحذف النهائي. يأخذ أول مستند جديد أصغرها. هذه الصلاحية لمدير النظام فقط.</div>
+      {keys.length === 0 ? <div style={{ fontSize: 13, color: "#8A8071" }}>لا توجد أرقام شاغرة — كل رقم محذوف يبقى محذوفًا ولا يتكرر.</div> : keys.map((k) => (
+        <div key={k} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", borderBottom: `1px dashed ${THEME.border}`, fontSize: 13.5 }}>
+          <span><b>{labels[k]}:</b> {(fn[k] || []).join("، ")}</span>
+          <Btn small variant="danger" onClick={() => update({ freedNumbers: { ...fn, [k]: [] } })}>مسح (لا تُستخدم مجددًا)</Btn>
+        </div>
+      ))}
+    </Panel>
+  );
+}
+
 // ---------- Dashboard ----------
-function Dashboard({ data }) {
+function Dashboard({ data, update, canEdit }) {
+  const [waOpen, setWaOpen] = useState(false);
+  const waCount = waPending(data).length;
   const activeOrders = data.orders.filter((o) => o.stage !== "تم التسليم" && !o.cancelled);
   const revenue = data.orders.filter((o) => !o.cancelled).reduce((s, o) => s + (Number(o.price) || 0), 0);
   const stageCounts = data.orderStages.map((s) => ({ stage: s, count: data.orders.filter((o) => o.stage === s).length }));
@@ -977,20 +1386,25 @@ function Dashboard({ data }) {
     { label: "إجمالي الطلبات", value: data.orders.length, icon: Package },
     { label: "إجمالي المبيعات", value: `${revenue.toLocaleString()} ر.س`, icon: Wallet },
   ];
-  const stockMap = {}; data.purchases.filter((p) => p.category === "قماش").forEach((p) => { stockMap[p.item] = (stockMap[p.item] || 0) + Number(p.qty || 0); });
-  const usedMap = {}; data.orders.forEach((o) => { if (o.fabricType) usedMap[o.fabricType] = (usedMap[o.fabricType] || 0) + Number(o.fabricUsed || 0); });
-  const lowStockItems = Object.keys(stockMap).filter((item) => { const threshold = Number(data.fabricThresholds?.[item] || 0); const remaining = stockMap[item] - (usedMap[item] || 0); return threshold > 0 && remaining <= threshold; });
+  const lowStockItems = lowStockList(data).map((x) => `${x.item.name} (${fmtNum(x.qty)} ${x.item.unit || ""}${data.branches.length > 1 ? ` — ${x.branchName}` : ""})`);
   const today = new Date().toISOString().slice(0, 10);
   const todaysAppointments = (data.appointments || []).filter((a) => a.date === today && a.status !== "ملغى");
 
   return (
     <div>
       <h2 style={{ fontFamily: "Amiri, serif", fontSize: 28, color: THEME.ink, marginTop: 0 }}>لوحة التحكم</h2>
+      {update && waCount > 0 && (
+        <div style={{ background: "#25D36618", border: "1px solid #25D366", borderRadius: 8, padding: 12, fontSize: 13.5, marginBottom: 14, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+          <span><b style={{ color: "#128C7E" }}>📱 رسائل واتساب بانتظارك:</b> {waCount} رسالة (جاهز للاستلام، تأخير، متبقٍ، شكر، مواعيد)</span>
+          <Btn small variant="brass" onClick={() => setWaOpen(true)}>فتح القائمة</Btn>
+        </div>
+      )}
+      {waOpen && <WhatsAppCenter data={data} update={update} canEdit={canEdit} onClose={() => setWaOpen(false)} />}
       {(lowStockItems.length > 0 || todaysAppointments.length > 0) && (
         <div style={{ display: "grid", gridTemplateColumns: lowStockItems.length && todaysAppointments.length ? "1fr 1fr" : "1fr", gap: 14, marginBottom: 20 }}>
           {lowStockItems.length > 0 && (
             <div style={{ background: `${THEME.red}12`, border: `1px solid ${THEME.red}`, borderRadius: 8, padding: 12, fontSize: 13.5 }}>
-              <b style={{ color: THEME.red }}>⚠ مخزون قماش منخفض:</b> {lowStockItems.join("، ")}
+              <b style={{ color: THEME.red }}>⚠ مخزون منخفض:</b> {lowStockItems.join("، ")}
             </div>
           )}
           {todaysAppointments.length > 0 && (
@@ -1030,7 +1444,7 @@ function customerStatementRows(data, c) {
   const ids = new Set(orders.map((o) => o.id));
   const rows = [
     ...orders.map((o) => ({ key: o.id, no: o.orderNo, noLabel: "طلب", date: o.createdAt, createdAt: "", desc: `${o.orderType || "طلب"}${Number(o.discount) > 0 ? ` (بعد خصم ${fmtNum(o.discount)})` : ""}`, kind: "طلبات", inc: Math.max(0, (Number(o.price) || 0) - (Number(o.discount) || 0)), dec: 0, branch: o.branch || def })),
-    ...data.vouchers.filter((v) => v.type === "قبض" && v.orderId && ids.has(v.orderId)).map((v) => ({ key: v.id, no: v.voucherNo, noLabel: "سند", isVoucher: true, voucher: v, date: v.date, createdAt: v.createdAt || "", desc: v.description || "دفعة", kind: v.category || "دفعة", inc: 0, dec: Number(v.amount) || 0, branch: v.branch || data.orders.find((o) => o.id === v.orderId)?.branch || def })),
+    ...liveVouchers(data).filter((v) => v.type === "قبض" && v.orderId && ids.has(v.orderId)).map((v) => ({ key: v.id, no: v.voucherNo, noLabel: "سند", isVoucher: true, voucher: v, date: v.date, createdAt: v.createdAt || "", desc: v.description || "دفعة", kind: v.category || "دفعة", inc: 0, dec: Number(v.amount) || 0, branch: v.branch || data.orders.find((o) => o.id === v.orderId)?.branch || def })),
   ].sort((a, b) => (a.date || "").localeCompare(b.date || "") || (a.createdAt || "").localeCompare(b.createdAt || ""));
   return rows;
 }
@@ -1038,12 +1452,17 @@ function CustomersView({ data, update, canEdit, currentUser }) {
   const [modal, setModal] = useState(null);
   const [statementFor, setStatementFor] = useState(null);
   const [printingVoucher, setPrintingVoucher] = useState(null);
+  const [delCustomer, setDelCustomer] = useState(null);
+  const deleteCustomer = (c, free) => {
+    update({ customers: data.customers.filter((x) => x.id !== c.id), auditLog: [...(data.auditLog || []), logEntry(currentUser, "حذف عميل (مدير النظام)", `${c.name}${free ? " — الكود أُتيح لإعادة الاستخدام" : ""}`)], ...withFreed(data, "customer", c.code, free) });
+    setDelCustomer(null);
+  };
   const save = (values) => {
     const list = [...data.customers];
     if (modal.mode === "add") {
-      const nextCode = (data.counters?.customer || 1000) + 1;
-      list.push({ id: uid("cust"), rating: 5, code: nextCode, ...values });
-      update({ customers: list, counters: { ...data.counters, customer: nextCode } });
+      const t = issueNumber(data, data.counters, "customer", 1000, data.customers.map((c) => c.code));
+      list.push({ id: uid("cust"), rating: 5, code: t.no, ...values });
+      update({ customers: list, counters: t.counters, freedNumbers: t.freedNumbers });
     } else {
       const i = list.findIndex((c) => c.id === values.id); list[i] = values;
       update({ customers: list });
@@ -1053,14 +1472,15 @@ function CustomersView({ data, update, canEdit, currentUser }) {
   const fields = [
     { key: "name", label: "اسم العميل" }, { key: "phone", label: "رقم الجوال" },
     { key: "familyGroup", label: "اسم العائلة / ملاحظة (لربط الأبناء)" }, { key: "preferredFabric", label: "تفضيل القماش" },
+    { key: "branch", label: "الفرع", type: "select", options: data.branches.map((b) => ({ value: b.id, label: b.name })) },
     { key: "notes", label: "ملاحظات", type: "textarea" },
   ];
   return (
     <>
       <CrudSection icon={Users} title="إدارة العملاء" addLabel="عميل جديد" columns={["الكود", "الاسم", "الجوال", "عدد الطلبات", "نقاط الولاء", "التقييم", "المتبقي عليه", ""]} items={data.customers} searchKeys={["name", "phone", "code"]}
-        onAdd={canEdit ? () => setModal({ mode: "add", values: {} }) : undefined}
+        onAdd={canEdit ? () => setModal({ mode: "add", values: { branch: data.branches[0]?.id } }) : undefined}
         onEdit={canEdit ? (it) => setModal({ mode: "edit", values: it }) : undefined}
-        onDelete={canEdit ? (it) => update({ customers: data.customers.filter((c) => c.id !== it.id), auditLog: [...(data.auditLog || []), logEntry(currentUser, "حذف عميل", it.name)] }) : undefined}
+        onDelete={canEdit && data._isAdmin ? (it) => setDelCustomer(it) : undefined}
         renderRow={(it) => {
           const custOrders = data.orders.filter((o) => o.customerId === it.id);
           const spend = custOrders.reduce((s, o) => s + (Number(o.price) || 0), 0);
@@ -1071,6 +1491,7 @@ function CustomersView({ data, update, canEdit, currentUser }) {
             {(() => { const rs = customerStatementRows(data, it); const bal = rs.reduce((t, r) => t + r.inc - r.dec, 0); return <td style={{ padding: "10px 14px", fontWeight: 700, color: bal > 0 ? THEME.red : THEME.teal }}>{fmtNum(bal)} ر.س</td>; })()}
             <td style={{ padding: "10px 14px" }}><Btn small variant="ghost" onClick={() => setStatementFor(it)}>كشف حساب</Btn></td></>);
         }} />
+      {delCustomer && <AdminDeleteModal title={`حذف العميل ${delCustomer.name}`} numberLabel="كود العميل" number={delCustomer.code} lines={["يُحذف سجل العميل فقط، وتبقى طلباته وسنداته في النظام."]} onConfirm={(free) => deleteCustomer(delCustomer, free)} onClose={() => setDelCustomer(null)} />}
       {statementFor && (() => {
         const c = data.customers.find((x) => x.id === statementFor.id) || statementFor;
         return (
@@ -1249,27 +1670,29 @@ function OrdersView({ data, update, canEdit, currentUser, currentUserRole }) {
     let order = orderInput;
     let patch = {};
     if (isNew) {
-      const nextNo = (data.counters?.order || 1000) + 1;
-      order = { ...orderInput, orderNo: nextNo };
-      patch.counters = { ...data.counters, order: nextNo };
+      const tn = issueNumber(data, data.counters, "order", 1000, data.orders.map((o) => o.orderNo));
+      order = { ...orderInput, orderNo: tn.no };
+      patch.counters = tn.counters; patch.freedNumbers = tn.freedNumbers;
       if (order.groupId === "__new__") {
-        const nextGroupNo = (patch.counters.group || data.counters?.group || 1000) + 1;
-        const group = { id: uid("grp"), groupNo: nextGroupNo, customerId: order.customerId, createdAt: new Date().toISOString().slice(0, 10) };
+        const tg = issueNumber({ ...data, freedNumbers: patch.freedNumbers }, patch.counters, "group", 1000, data.orderGroups.map((g) => g.groupNo));
+        const group = { id: uid("grp"), groupNo: tg.no, customerId: order.customerId, createdAt: new Date().toISOString().slice(0, 10) };
         patch.orderGroups = [...data.orderGroups, group];
-        patch.counters = { ...patch.counters, group: nextGroupNo };
+        patch.counters = tg.counters; patch.freedNumbers = tg.freedNumbers;
         order = { ...order, groupId: group.id };
       }
+      order = { ...order, materials: order.materials || materialsFromRules(data, order.orderType) };
       list.push(order);
     } else {
+      if (list[i].orderType !== order.orderType && !order.materialsEdited) order = { ...order, materials: materialsFromRules(data, order.orderType) };
       list[i] = order;
     }
     patch.orders = list;
     if (isNew && Number(order.deposit) > 0) {
       const accountId = PAYMENT_ACCOUNT_MAP[order.paymentMethod];
       if (accountId) {
-        const bv = buildVoucher(patch.counters || data.counters, { type: "قبض", accountId, branch: order.branch, category: "عربون", amount: Number(order.deposit), description: `عربون طلب #${order.orderNo} — ${custName(order.customerId)}`, date: todayStr(), orderId: order.id, partyType: "عميل", partyId: order.customerId }, currentUser);
+        const bv = buildVoucher(patch.counters || data.counters, { type: "قبض", accountId, branch: order.branch, category: "عربون", amount: Number(order.deposit), description: `عربون طلب #${order.orderNo} — ${custName(order.customerId)}`, date: todayStr(), orderId: order.id, partyType: "عميل", partyId: order.customerId }, currentUser, { ...data, freedNumbers: patch.freedNumbers });
         patch.vouchers = [...data.vouchers, bv.voucher];
-        patch.counters = bv.counters;
+        patch.counters = bv.counters; patch.freedNumbers = bv.freedNumbers;
         patch.financeAccounts = data.financeAccounts.map((a) => a.id === accountId ? { ...a, balance: (Number(a.balance) || 0) + Number(order.deposit) } : a);
       }
     }
@@ -1284,12 +1707,12 @@ function OrdersView({ data, update, canEdit, currentUser, currentUserRole }) {
     if (!amt || amt <= 0) { alert("أدخل مبلغًا صحيحًا"); return; }
     const accountId = PAYMENT_ACCOUNT_MAP[method];
     if (!accountId) { alert("طريقة الدفع هذه (تقسيط) تحتاج ربط مزوّد خارجي فعلي ولا يمكن تسجيلها في الصندوق مباشرة الآن"); return; }
-    const bv = buildVoucher(data.counters, { type: "قبض", accountId, branch: order.branch, category: "دفعة على الحساب", amount: amt, description: `دفعة لطلب #${order.orderNo || order.id.slice(-6)} — ${custName(order.customerId)}`, date: todayStr(), orderId: order.id, partyType: "عميل", partyId: order.customerId }, currentUser);
+    const bv = buildVoucher(data.counters, { type: "قبض", accountId, branch: order.branch, category: "دفعة على الحساب", amount: amt, description: `دفعة لطلب #${order.orderNo || order.id.slice(-6)} — ${custName(order.customerId)}`, date: todayStr(), orderId: order.id, partyType: "عميل", partyId: order.customerId }, currentUser, data);
     const vouchers = [...data.vouchers, bv.voucher];
     const financeAccounts = data.financeAccounts.map((a) => a.id === accountId ? { ...a, balance: (Number(a.balance) || 0) + amt } : a);
     const updatedOrder = { ...order, deposit: (Number(order.deposit) || 0) + amt };
     const orders = data.orders.map((o) => o.id === order.id ? updatedOrder : o);
-    update({ orders, vouchers, financeAccounts, counters: bv.counters });
+    update({ orders, vouchers, financeAccounts, counters: bv.counters, freedNumbers: bv.freedNumbers });
     setDetail(updatedOrder);
     setPayAmount("");
   };
@@ -1302,35 +1725,27 @@ function OrdersView({ data, update, canEdit, currentUser, currentUserRole }) {
   const custName = (id) => data.customers.find((c) => c.id === id)?.name || "—";
 
   const isSystemAdmin = currentUserRole === "مدير عام";
-  const permanentlyDeleteOrder = (order) => {
-    if (!window.confirm(`تحذير: هذا حذف نهائي لا يمكن التراجع عنه للطلب #${order.orderNo || order.id.slice(-6)} — سيختفي بالكامل من كل السجلات والتقارير.\nهل أنت متأكد تمامًا؟`)) return;
-    if (!window.confirm("تأكيد أخير: اضغط موافق فقط إذا كنت متأكدًا 100%.")) return;
-    const linked = data.vouchers.filter((v) => v.orderId === order.id);
-    const financeAccounts = data.financeAccounts.map((a) => {
-      const sum = linked.filter((v) => v.accountId === a.id).reduce((s, v) => s + (Number(v.amount) || 0), 0);
-      return sum ? { ...a, balance: (Number(a.balance) || 0) - sum } : a;
-    });
-    const vouchers = data.vouchers.filter((v) => v.orderId !== order.id);
+  const [delOrder, setDelOrder] = useState(null);
+  const permanentlyDeleteOrder = (order, freeNo) => {
+    const cv = cancelVouchersWhere(data, (v) => v.orderId === order.id, `حذف نهائي للطلب #${order.orderNo || order.id.slice(-6)}`, currentUser);
+    const { vouchers, financeAccounts } = cv;
     const orders = data.orders.filter((o) => o.id !== order.id);
-    const auditLog = [...(data.auditLog || []), logEntry(currentUser, "حذف نهائي لطلب (مدير النظام)", `طلب #${order.orderNo || order.id.slice(-6)} — ${custName(order.customerId)}`)];
-    update({ orders, vouchers, financeAccounts, auditLog, employeeLedger: (data.employeeLedger || []).filter((l) => l.orderId !== order.id) });
-    setDetail(null);
+    const auditLog = [...(data.auditLog || []), logEntry(currentUser, "حذف نهائي لطلب (مدير النظام)", `طلب #${order.orderNo || order.id.slice(-6)} — ${custName(order.customerId)}${freeNo ? " — الرقم أُتيح لإعادة الاستخدام" : ""}`)];
+    update({ orders, vouchers, financeAccounts, auditLog, employeeLedger: (data.employeeLedger || []).filter((l) => l.orderId !== order.id), ...withFreed(data, "order", order.orderNo, freeNo) });
+    setDetail(null); setDelOrder(null);
   };
 
   return (
     <>
+      {delOrder && <AdminDeleteModal title={`حذف نهائي للطلب #${delOrder.orderNo || ""}`} numberLabel="رقم الطلب" number={delOrder.orderNo} lines={["يُحذف الطلب مع قيود الموظفين المرتبطة به، وتُلغى سنداته وتُعاد أرصدة الحسابات."]} onConfirm={(free) => permanentlyDeleteOrder(delOrder, free)} onClose={() => setDelOrder(null)} />}
       <CrudSection icon={ShoppingBag} title="إدارة الطلبات" addLabel="طلب جديد" columns={["الرقم", "العميل", "النوع", "الطلبية", "الفرع", "التسليم", "المرحلة", "الموقع"]} items={data.orders} searchKeys={["orderNo"]}
         onAdd={canEdit ? () => data.customers.length ? setModal({ ...emptyOrder(data) }) : alert("أضف عميلاً أولاً من قسم إدارة العملاء") : undefined}
         onEdit={canEdit ? (it) => setModal(it) : undefined}
         onDelete={canEdit ? (it) => {
           if (it.cancelled) { alert("هذا الطلب ملغى بالفعل."); return; }
           if (!window.confirm(`سيتم إلغاء الطلب #${it.orderNo || it.id.slice(-6)} مع الاحتفاظ بسجله (لا يُحذف نهائيًا). متابعة؟`)) return;
-          const linked = data.vouchers.filter((v) => v.orderId === it.id);
-          const financeAccounts = data.financeAccounts.map((a) => {
-            const sum = linked.filter((v) => v.accountId === a.id).reduce((s, v) => s + (Number(v.amount) || 0), 0);
-            return sum ? { ...a, balance: (Number(a.balance) || 0) - sum } : a;
-          });
-          const vouchers = data.vouchers.filter((v) => v.orderId !== it.id);
+          const cv = cancelVouchersWhere(data, (v) => v.orderId === it.id, `إلغاء الطلب #${it.orderNo || it.id.slice(-6)}`, currentUser);
+          const { vouchers, financeAccounts } = cv;
           const orders = data.orders.map((o) => o.id === it.id ? { ...o, cancelled: true, cancelledAt: new Date().toLocaleString("ar-SA") } : o);
           const auditLog = [...(data.auditLog || []), logEntry(currentUser, "إلغاء طلب", `طلب #${it.orderNo || it.id.slice(-6)} — ${custName(it.customerId)}`)];
           update({ orders, vouchers, financeAccounts, auditLog, employeeLedger: (data.employeeLedger || []).filter((l) => l.orderId !== it.id) });
@@ -1354,7 +1769,7 @@ function OrdersView({ data, update, canEdit, currentUser, currentUserRole }) {
             <Badge color={THEME.brass}>{detail.stage}</Badge>
             {canEdit && detail.stage !== "تم التسليم" && <Btn small variant="ghost" onClick={() => advanceStage(detail)}>ترقية للمرحلة التالية<ChevronLeft size={14} /></Btn>}
             <Btn small variant="ghost" onClick={() => { const link = `${window.location.origin}${window.location.pathname}?track=${detail.orderNo}`; navigator.clipboard?.writeText(link); alert("تم نسخ رابط التتبع:\n" + link); }}>نسخ رابط تتبع للعميل</Btn>
-            {isSystemAdmin && <Btn small variant="danger" onClick={() => permanentlyDeleteOrder(detail)}>🗑 حذف نهائي (مدير النظام فقط)</Btn>}
+            {isSystemAdmin && <Btn small variant="danger" onClick={() => setDelOrder(detail)}>🗑 حذف نهائي (مدير النظام فقط)</Btn>}
             <BarcodeSVG value={detail.orderNo} height={34} width={1.4} />
           </div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20 }}>
@@ -1363,6 +1778,7 @@ function OrdersView({ data, update, canEdit, currentUser, currentUserRole }) {
               {data.measurementFields.map((m) => <div key={m.key} style={{ display: "flex", justifyContent: "space-between", fontSize: 13.5, padding: "5px 0", borderBottom: `1px dashed ${THEME.border}` }}><span>{m.label}</span><span>{detail.measurements[m.key] || "—"}</span></div>)}
               <div style={{ fontWeight: 700, margin: "12px 0 6px" }}>القماش</div>
               <div style={{ fontSize: 13.5 }}>النوع: {detail.fabricType || "—"} — الكمية: {detail.fabricUsed || 0} متر</div>
+              {(detail.materials || []).length > 0 && <div style={{ fontSize: 12.5, color: "#5C5344", marginTop: 4 }}>مواد أخرى مخصومة من المخزون: {detail.materials.map((m) => { const it = (data.inventoryItems || []).find((x) => x.id === m.itemId); return `${it?.name || "—"} ${fmtNum(m.qty)} ${it?.unit || ""}`; }).join("، ")}</div>}
               <div style={{ fontWeight: 700, margin: "12px 0 6px" }}>التطريز</div>
               {detail.embroideryType && detail.embroideryType !== "بدون" ? (
                 <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
@@ -1382,7 +1798,7 @@ function OrdersView({ data, update, canEdit, currentUser, currentUserRole }) {
               </div>
               <div style={{ fontWeight: 700, margin: "12px 0 6px" }}>الدفعات المالية المسجّلة</div>
               {(() => {
-                const linked = data.vouchers.filter((v) => v.orderId === detail.id);
+                const linked = liveVouchers(data).filter((v) => v.orderId === detail.id);
                 const totalPaid = linked.reduce((s, v) => s + (Number(v.amount) || 0), 0);
                 const remaining = (Number(detail.price) || 0) - totalPaid;
                 return (
@@ -1423,6 +1839,18 @@ function OrdersView({ data, update, canEdit, currentUser, currentUserRole }) {
                 <div style={{ marginTop: 14, background: `${THEME.teal}1a`, border: `1px solid ${THEME.teal}`, borderRadius: 8, padding: 12 }}>
                   <div style={{ fontWeight: 700, color: THEME.teal, marginBottom: 8 }}>🎉 الطلب جاهز للتسليم — أرسل إشعار للعميل الآن</div>
                   {canEdit ? <WhatsAppNotifyButton order={detail} data={data} update={update} custPhone={data.customers.find((c) => c.id === detail.customerId)?.phone} custName={custName(detail.customerId)} /> : <div style={{ fontSize: 12, color: "#8A8071" }}>لا تملك صلاحية إرسال إشعارات.</div>}
+                </div>
+              )}
+              {canEdit && orderBalance(detail) > 0 && !detail.cancelled && (
+                <div style={{ marginTop: 14, background: `#C7770018`, border: `1px solid #C77700`, borderRadius: 8, padding: 12 }}>
+                  <div style={{ fontWeight: 700, color: "#C77700", marginBottom: 8 }}>💰 المتبقي على العميل {fmtNum(orderBalance(detail))} ر.س</div>
+                  <WhatsAppNotifyButton order={detail} data={data} update={update} custPhone={data.customers.find((c) => c.id === detail.customerId)?.phone} custName={custName(detail.customerId)} templateField="balanceMessageTemplate" trackField="balanceNotifiedAt" buttonLabel="📱 تذكير بالمبلغ المتبقي" sentLabel="آخر تذكير" />
+                </div>
+              )}
+              {canEdit && !detail.cancelled && detail.stage !== "جاهز للتسليم" && detail.stage !== "تم التسليم" && detail.deliveryDate && detail.deliveryDate < todayStr() && (
+                <div style={{ marginTop: 14, background: `${THEME.red}12`, border: `1px solid ${THEME.red}`, borderRadius: 8, padding: 12 }}>
+                  <div style={{ fontWeight: 700, color: THEME.red, marginBottom: 8 }}>⏰ الطلب متأخر عن موعد التسليم ({detail.deliveryDate})</div>
+                  <WhatsAppNotifyButton order={detail} data={data} update={update} custPhone={data.customers.find((c) => c.id === detail.customerId)?.phone} custName={custName(detail.customerId)} templateField="delayMessageTemplate" trackField="delayNotifiedAt" buttonLabel="📱 اعتذار عن التأخير" sentLabel="آخر اعتذار" />
                 </div>
               )}
               {detail.stage === "تم التسليم" && (
@@ -1698,6 +2126,7 @@ function AppointmentsView({ data, update, canEdit }) {
     if (!cust?.phone) { alert("لا يوجد رقم جوال مسجّل لهذا العميل."); return; }
     const message = fillTemplate(data.shopSettings?.reminderMessageTemplate, { name: cust.name, date: apt.date, time: apt.time, shop: data.shopSettings?.name || "" });
     window.open(buildWhatsAppLink(cust.phone, message), "_blank");
+    update({ appointments: data.appointments.map((a) => a.id === apt.id ? { ...a, remindedAt: new Date().toISOString() } : a) });
   };
   return (
     <>
@@ -1792,7 +2221,7 @@ function employeeStatement(data, e) {
       const where = l.branchId ? { branch: l.branchId } : ord ? { branch: ord.branch || def } : ebr.length > 1 ? { weights } : { branch: ebr[0] || def };
       return { key: l.id, no: l.entryNo, noLabel: "قيد", date: l.date, createdAt: l.createdAt || "", desc: l.desc, kind: l.kind, inc: Number(l.credit) || 0, dec: Number(l.debit) || 0, ...where };
     }),
-    ...data.vouchers.filter((v) => v.employeeId === e.id).map((v) => {
+    ...liveVouchers(data).filter((v) => v.employeeId === e.id).map((v) => {
       const amt = Number(v.amount) || 0, out = v.type === "صرف";
       return { key: v.id, no: v.voucherNo, noLabel: "سند", isVoucher: true, voucher: v, date: v.date, createdAt: v.createdAt || "", desc: (out ? (v.category || "دفعة") : "مبلغ مقبوض من الموظف") + (v.description ? ` — ${v.description}` : ""), kind: out ? (v.category === "سلفة موظف" ? "سلفة" : "دفعة") : "قبض", inc: out ? 0 : amt, dec: out ? amt : 0, branch: v.branch || ebr[0] || def };
     }),
@@ -1883,9 +2312,9 @@ function EmployeesView({ data, update, canEdit, currentUser }) {
     const amt = Number(values.amount);
     if (!amt || amt <= 0) { alert("أدخل مبلغًا صحيحًا"); return; }
     const isAdvance = values.kind === "سلفة موظف";
-    const bv = buildVoucher(data.counters, { type: "صرف", accountId: values.accountId, branch: values.branch || empBranches(data, employee)[0], category: isAdvance ? "سلفة موظف" : "رواتب", amount: amt, description: values.note || (isAdvance ? `سلفة للموظف ${employee.name}` : `صرف مستحقات الموظف ${employee.name}`), date: values.date || todayStr(), partyType: "موظف", partyId: employee.id, employeeId: employee.id, partyName: employee.name, partyPhone: employee.phone || "" }, currentUser);
+    const bv = buildVoucher(data.counters, { type: "صرف", accountId: values.accountId, branch: values.branch || empBranches(data, employee)[0], category: isAdvance ? "سلفة موظف" : "رواتب", amount: amt, description: values.note || (isAdvance ? `سلفة للموظف ${employee.name}` : `صرف مستحقات الموظف ${employee.name}`), date: values.date || todayStr(), partyType: "موظف", partyId: employee.id, employeeId: employee.id, partyName: employee.name, partyPhone: employee.phone || "" }, currentUser, data);
     const financeAccounts = data.financeAccounts.map((a) => a.id === values.accountId ? { ...a, balance: (Number(a.balance) || 0) - amt } : a);
-    update({ vouchers: [...data.vouchers, bv.voucher], financeAccounts, counters: bv.counters });
+    update({ vouchers: [...data.vouchers, bv.voucher], financeAccounts, counters: bv.counters, freedNumbers: bv.freedNumbers });
     setPayModal(null);
     setPrintingVoucher(bv.voucher);
   };
@@ -1932,7 +2361,7 @@ function EmployeesView({ data, update, canEdit, currentUser }) {
     const sumBy = (arr, f) => round2(arr.reduce((t, x) => t + (Number(f(x)) || 0), 0));
     const revenue = sumBy(data.orders.filter((o) => !o.cancelled && o.branch === branchId && inMonth(o.createdAt)), (o) => Math.max(0, (Number(o.price) || 0) - (Number(o.discount) || 0)));
     const purchases = sumBy(data.purchases.filter((x) => (x.branch || defaultBranch) === branchId && inMonth(x.date)), (x) => x.cost);
-    const expenses = sumBy(data.vouchers.filter((v) => v.type === "صرف" && (v.branch || defaultBranch) === branchId && inMonth(v.date) && !v.employeeId && !v.supplierId), (v) => v.amount);
+    const expenses = sumBy(liveVouchers(data).filter((v) => v.type === "صرف" && (v.branch || defaultBranch) === branchId && inMonth(v.date) && !v.employeeId && !v.supplierId), (v) => v.amount);
     const wages = round2((data.employeeLedger || []).filter((l) => ["راتب", "قطعة", "نسبة", "مكافأة"].includes(l.kind) && (l.month ? l.month === month : inMonth(l.date))).reduce((t, l) => {
       const emp = data.employees.find((e) => e.id === l.employeeId);
       const ord = l.orderId ? data.orders.find((o) => o.id === l.orderId) : null;
@@ -2134,7 +2563,7 @@ function EmployeesView({ data, update, canEdit, currentUser }) {
             labels={{ inc: "له (مستحق)", dec: "عليه (مدفوع / مخصوم)", balanceText: (b) => `الرصيد: ${fmtNum(b)} ر.س ${b > 0 ? "(مستحق للموظف)" : b < 0 ? "(مستحق على الموظف)" : ""}` }}
             renderAction={(r) => r.isVoucher
               ? <button onClick={() => setPrintingVoucher(r.voucher)} title="طباعة السند" style={{ background: "none", border: "none", cursor: "pointer" }}><Printer size={14} /></button>
-              : (canEdit && <button onClick={() => removeEntry(r)} title="حذف القيد" style={{ background: "none", border: "none", cursor: "pointer", color: THEME.red }}><Trash2 size={14} /></button>)} />
+              : (canEdit && data._isAdmin && <button onClick={() => removeEntry(r)} title="حذف القيد" style={{ background: "none", border: "none", cursor: "pointer", color: THEME.red }}><Trash2 size={14} /></button>)} />
         );
       })()}
       {printingVoucher && <VoucherPrintModal data={data} voucher={printingVoucher} onClose={() => setPrintingVoucher(null)} />}
@@ -2160,22 +2589,33 @@ function SuppliersView({ data, update, canEdit }) {
     { key: "unit", label: "الوحدة (متر، قطعة...)" }, { key: "cost", label: "التكلفة (ر.س)", type: "number" },
     { key: "date", label: "التاريخ", type: "date" },
   ];
+  // buying an item that is not in the inventory catalog yet adds it automatically
+  const [delPurchase, setDelPurchase] = useState(null);
+  const deletePurchase = (pu, free) => {
+    update({ purchases: data.purchases.filter((x) => x.id !== pu.id), auditLog: [...(data.auditLog || []), logEntry("مدير النظام", "حذف عملية شراء", `#${pu.purchaseNo} — ${pu.item}${free ? " — الرقم أُتيح لإعادة الاستخدام" : ""}`)], ...withFreed(data, "purchase", pu.purchaseNo, free) });
+    setDelPurchase(null);
+  };
+  const withItem = (values) => {
+    const items = data.inventoryItems || []; const nm = normName(values.item);
+    if (!nm || !(Number(values.qty) > 0) || items.some((i) => normName(i.name) === nm)) return {};
+    return { inventoryItems: [...items, { id: uid("inv"), name: String(values.item).trim(), category: values.category || "أخرى", unit: values.unit || "", minQty: 0 }] };
+  };
   const savePurchase = (values) => {
     const list = [...data.purchases];
     if (pModal.mode === "add") {
-      const nextNo = (data.counters?.purchase || 1000) + 1;
-      list.push({ id: uid("pur"), purchaseNo: nextNo, ...values });
-      update({ purchases: list, counters: { ...data.counters, purchase: nextNo } });
+      const t = issueNumber(data, data.counters, "purchase", 1000, data.purchases.map((x) => x.purchaseNo));
+      list.push({ id: uid("pur"), purchaseNo: t.no, ...values });
+      update({ purchases: list, counters: t.counters, freedNumbers: t.freedNumbers, ...withItem(values) });
     } else {
       const i = list.findIndex((p) => p.id === values.id); list[i] = values;
-      update({ purchases: list });
+      update({ purchases: list, ...withItem(values) });
     }
     setPModal(null);
   };
 
   const supplierBalance = (s) => {
     const purchased = data.purchases.filter((p) => p.supplierId === s.id).reduce((sum, p) => sum + (Number(p.cost) || 0), 0);
-    const paid = data.vouchers.filter((v) => v.type === "صرف" && v.supplierId === s.id).reduce((sum, v) => sum + (Number(v.amount) || 0), 0);
+    const paid = liveVouchers(data).filter((v) => v.type === "صرف" && v.supplierId === s.id).reduce((sum, v) => sum + (Number(v.amount) || 0), 0);
     return (Number(s.openingBalance) || 0) + purchased - paid;
   };
   const payFields = [
@@ -2185,16 +2625,13 @@ function SuppliersView({ data, update, canEdit }) {
   const savePayment = () => {
     const amt = Number(payModal.values.amount);
     if (!amt || amt <= 0) { alert("أدخل مبلغًا صحيحًا"); return; }
-    const bv = buildVoucher(data.counters, { type: "صرف", accountId: payModal.values.accountId, branch: data.branches[0]?.id, category: "دفعة لمورد", amount: amt, description: `دفعة للمورد ${payModal.supplier.name}`, date: payModal.values.date || todayStr(), supplierId: payModal.supplier.id, partyType: "مورد", partyId: payModal.supplier.id });
+    const bv = buildVoucher(data.counters, { type: "صرف", accountId: payModal.values.accountId, branch: data.branches[0]?.id, category: "دفعة لمورد", amount: amt, description: `دفعة للمورد ${payModal.supplier.name}`, date: payModal.values.date || todayStr(), supplierId: payModal.supplier.id, partyType: "مورد", partyId: payModal.supplier.id }, undefined, data);
     const vouchers = [...data.vouchers, bv.voucher];
     const financeAccounts = data.financeAccounts.map((a) => a.id === payModal.values.accountId ? { ...a, balance: (Number(a.balance) || 0) - amt } : a);
-    update({ vouchers, financeAccounts, counters: bv.counters });
+    update({ vouchers, financeAccounts, counters: bv.counters, freedNumbers: bv.freedNumbers });
     setPayModal(null);
   };
 
-  const stockMap = {}; data.purchases.filter((p) => p.category === "قماش").forEach((p) => { stockMap[p.item] = (stockMap[p.item] || 0) + Number(p.qty || 0); });
-  const usedMap = {}; data.orders.forEach((o) => { if (o.fabricType) usedMap[o.fabricType] = (usedMap[o.fabricType] || 0) + Number(o.fabricUsed || 0); });
-  const stockRows = Object.keys(stockMap).map((item) => ({ item, purchased: stockMap[item], used: usedMap[item] || 0, remaining: stockMap[item] - (usedMap[item] || 0) }));
 
   return (
     <div>
@@ -2221,32 +2658,13 @@ function SuppliersView({ data, update, canEdit }) {
         }} />
 
       <div style={{ height: 24 }} />
-      <Panel style={{ marginBottom: 20 }}>
-        <div style={{ fontWeight: 700, marginBottom: 10 }}>مخزون الأقمشة الحالي</div>
-        {stockRows.length === 0 ? <EmptyState text="سجّل مشتريات قماش لعرض المخزون" /> : stockRows.map((r) => {
-          const threshold = Number(data.fabricThresholds?.[r.item] || 0);
-          const isLow = threshold > 0 && r.remaining <= threshold;
-          return (
-            <div key={r.item} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 0", borderBottom: `1px dashed ${THEME.border}`, fontSize: 13.5, background: isLow ? `${THEME.red}0f` : "transparent" }}>
-              <span>{r.item} {isLow && <Badge color={THEME.red}>منخفض ⚠</Badge>}</span>
-              <span style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                مُشترى: {r.purchased} م — مستخدم: {r.used} م — <b style={{ color: isLow ? THEME.red : "inherit" }}>المتبقي: {r.remaining} م</b>
-                {canEdit && (
-                  <span style={{ fontSize: 11.5, color: "#8A8071", display: "flex", alignItems: "center", gap: 4 }}>
-                    حد التنبيه:
-                    <input type="number" defaultValue={data.fabricThresholds?.[r.item] || ""} onBlur={(e) => update({ fabricThresholds: { ...(data.fabricThresholds || {}), [r.item]: e.target.value } })} style={{ width: 55, padding: "3px 5px", border: `1px solid ${THEME.border}`, borderRadius: 4 }} />
-                  </span>
-                )}
-              </span>
-            </div>
-          );
-        })}
-      </Panel>
+      <div style={{ fontSize: 12.5, color: "#7A7061", marginBottom: 14 }}>المخزون الحالي والتنبيهات وقواعد الاستهلاك في شاشة «المخزون». أي صنف تشتريه يُضاف إليها تلقائيًا.</div>
 
+      {delPurchase && <AdminDeleteModal title={`حذف عملية الشراء #${delPurchase.purchaseNo || ""}`} numberLabel="رقم الشراء" number={delPurchase.purchaseNo} lines={[`${delPurchase.item} — ${fmtNum(delPurchase.cost)} ر.س. سيتأثر المخزون وكشف المورد.`]} onConfirm={(free) => deletePurchase(delPurchase, free)} onClose={() => setDelPurchase(null)} />}
       <CrudSection icon={Truck} title="سجل المشتريات" addLabel="عملية شراء" columns={["الرقم", "المورد", "التصنيف", "الصنف", "الكمية", "التكلفة", "التاريخ", "مرفق"]} items={data.purchases} searchKeys={["item", "purchaseNo"]}
         onAdd={canEdit ? () => data.suppliers.length ? setPModal({ mode: "add", values: { category: categories[0], supplierId: data.suppliers[0]?.id || "", branch: data.branches[0]?.id || "", date: todayStr() } }) : alert("أضف موردًا أولاً") : undefined}
         onEdit={canEdit ? (it) => setPModal({ mode: "edit", values: it }) : undefined}
-        onDelete={canEdit ? (it) => update({ purchases: data.purchases.filter((p) => p.id !== it.id) }) : undefined}
+        onDelete={canEdit && data._isAdmin ? (it) => setDelPurchase(it) : undefined}
         renderRow={(it) => (<><td style={{ padding: "10px 14px", fontWeight: 700, color: THEME.brass }}>#{it.purchaseNo || it.id.slice(-6)}</td><td style={{ padding: "10px 14px" }}>{data.suppliers.find((s) => s.id === it.supplierId)?.name || "—"}</td><td style={{ padding: "10px 14px" }}>{it.category}</td><td style={{ padding: "10px 14px" }}>{it.item}</td><td style={{ padding: "10px 14px" }}>{it.qty} {it.unit}</td><td style={{ padding: "10px 14px" }}>{it.cost} ر.س</td><td style={{ padding: "10px 14px" }}>{it.date}</td><td style={{ padding: "10px 14px" }}><Btn small variant="ghost" onClick={() => setPrintingPurchase(it)}><Printer size={13} />{it.attachment ? "📎" : ""}</Btn></td></>)} />
 
       {sModal && <Modal title={sModal.mode === "add" ? "إضافة مورد" : "تعديل مورد"} onClose={() => setSModal(null)}><FormFields fields={sFields} values={sModal.values} setValues={(v) => setSModal({ ...sModal, values: v })} /><div style={{ display: "flex", gap: 8 }}><Btn variant="brass" onClick={() => saveSupplier(sModal.values)}>حفظ</Btn><Btn variant="ghost" onClick={() => setSModal(null)}>إلغاء</Btn></div></Modal>}
@@ -2269,7 +2687,7 @@ function SuppliersView({ data, update, canEdit }) {
         const def = data.branches[0]?.id;
         const rows = [
           ...data.purchases.filter((x) => x.supplierId === sp.id).map((x) => ({ key: x.id, no: x.purchaseNo, noLabel: "شراء", date: x.date, createdAt: "", desc: `شراء: ${x.item}${x.qty ? ` (${x.qty} ${x.unit || ""})` : ""}`, kind: `شراء ${x.category || ""}`.trim(), inc: Number(x.cost) || 0, dec: 0, branch: x.branch || def })),
-          ...data.vouchers.filter((v) => v.type === "صرف" && v.supplierId === sp.id).map((v) => ({ key: v.id, no: v.voucherNo, noLabel: "سند", date: v.date, createdAt: v.createdAt || "", desc: v.description || "دفعة مسدّدة", kind: "سداد", inc: 0, dec: Number(v.amount) || 0, branch: v.branch || def })),
+          ...liveVouchers(data).filter((v) => v.type === "صرف" && v.supplierId === sp.id).map((v) => ({ key: v.id, no: v.voucherNo, noLabel: "سند", date: v.date, createdAt: v.createdAt || "", desc: v.description || "دفعة مسدّدة", kind: "سداد", inc: 0, dec: Number(v.amount) || 0, branch: v.branch || def })),
         ].sort((a, b) => (a.date || "").localeCompare(b.date || "") || (a.createdAt || "").localeCompare(b.createdAt || ""));
         return (
           <StatementView data={data} title={`كشف حساب المورد — ${sp.name}`} onClose={() => setStatementFor(null)}
@@ -2295,24 +2713,24 @@ function SuppliersView({ data, update, canEdit }) {
 // ---------- Finance ----------
 // ---------- Finance charts (shared by Finance & Reports) ----------
 function FinanceCharts({ data }) {
-  const collectedFor = (orderId) => data.vouchers.filter((v) => v.orderId === orderId).reduce((s, v) => s + (Number(v.amount) || 0), 0);
+  const collectedFor = (orderId) => liveVouchers(data).filter((v) => v.orderId === orderId).reduce((s, v) => s + (Number(v.amount) || 0), 0);
 
   const perBranch = data.branches.map((b) => {
-    const income = data.vouchers.filter((v) => v.type === "قبض" && v.branch === b.id).reduce((s, v) => s + (Number(v.amount) || 0), 0);
-    const expense = data.vouchers.filter((v) => v.type === "صرف" && v.branch === b.id).reduce((s, v) => s + (Number(v.amount) || 0), 0);
+    const income = liveVouchers(data).filter((v) => v.type === "قبض" && v.branch === b.id).reduce((s, v) => s + (Number(v.amount) || 0), 0);
+    const expense = liveVouchers(data).filter((v) => v.type === "صرف" && v.branch === b.id).reduce((s, v) => s + (Number(v.amount) || 0), 0);
     const remaining = data.orders.filter((o) => o.branch === b.id && !o.cancelled).reduce((s, o) => { const rem = (Number(o.price) || 0) - collectedFor(o.id); return s + (rem > 0 ? rem : 0); }, 0);
     return { name: b.name, الوارد: income, المصروف: expense, المتبقي: remaining };
   });
 
-  const totalIncome = data.vouchers.filter((v) => v.type === "قبض").reduce((s, v) => s + (Number(v.amount) || 0), 0);
-  const totalDeposits = data.vouchers.filter((v) => v.type === "قبض" && v.category === "عربون").reduce((s, v) => s + (Number(v.amount) || 0), 0);
-  const totalExpense = data.vouchers.filter((v) => v.type === "صرف").reduce((s, v) => s + (Number(v.amount) || 0), 0);
+  const totalIncome = liveVouchers(data).filter((v) => v.type === "قبض").reduce((s, v) => s + (Number(v.amount) || 0), 0);
+  const totalDeposits = liveVouchers(data).filter((v) => v.type === "قبض" && v.category === "عربون").reduce((s, v) => s + (Number(v.amount) || 0), 0);
+  const totalExpense = liveVouchers(data).filter((v) => v.type === "صرف").reduce((s, v) => s + (Number(v.amount) || 0), 0);
   const totalRemaining = data.orders.reduce((s, o) => { const rem = (Number(o.price) || 0) - collectedFor(o.id); return s + (rem > 0 ? rem : 0); }, 0);
   const totalInvoiced = data.orders.reduce((s, o) => s + (Number(o.price) || 0), 0);
   const collectionRate = totalInvoiced > 0 ? Math.round((totalIncome / totalInvoiced) * 100) : 0;
 
   const compositionMap = {};
-  data.vouchers.filter((v) => v.type === "قبض").forEach((v) => { const c = v.category || "أخرى"; compositionMap[c] = (compositionMap[c] || 0) + (Number(v.amount) || 0); });
+  liveVouchers(data).filter((v) => v.type === "قبض").forEach((v) => { const c = v.category || "أخرى"; compositionMap[c] = (compositionMap[c] || 0) + (Number(v.amount) || 0); });
   const compositionData = Object.entries(compositionMap).map(([name, value]) => ({ name, value }));
   const PIE_COLORS = [THEME.brass, THEME.teal, "#8A8071", THEME.red];
 
@@ -2373,6 +2791,27 @@ function FinanceCharts({ data }) {
 }
 
 function FinanceView({ data, update, canEdit, currentUser }) {
+  const [cancelModal, setCancelModal] = useState(null);
+  const [delVoucher, setDelVoucher] = useState(null);
+  const deleteVoucherForever = (v, free) => {
+    const live = v.status !== "cancelled"; const amt = Number(v.amount) || 0;
+    const financeAccounts = live ? data.financeAccounts.map((a) => a.id === v.accountId ? { ...a, balance: round2((Number(a.balance) || 0) + (v.type === "قبض" ? -amt : amt)) } : a) : data.financeAccounts;
+    const orders = live && v.orderId && v.type === "قبض" ? data.orders.map((o) => o.id === v.orderId ? { ...o, deposit: Math.max(0, (Number(o.deposit) || 0) - amt) } : o) : data.orders;
+    const auditLog = [...(data.auditLog || []), logEntry(currentUser, "حذف نهائي لسند (مدير النظام)", `سند ${v.type} رقم ${v.voucherNo} — ${fmtNum(amt)} ر.س${free ? " — الرقم أُتيح لإعادة الاستخدام" : ""}`)];
+    update({ vouchers: data.vouchers.filter((x) => x.id !== v.id), financeAccounts, orders, auditLog, ...withFreed(data, "voucher", v.voucherNo, free) });
+    setDelVoucher(null);
+  };
+  const cancelVoucher = () => {
+    const { voucher: v, reason } = cancelModal;
+    if (!String(reason || "").trim()) { alert("اكتب سبب الإلغاء"); return; }
+    const cv = cancelVouchersWhere(data, (x) => x.id === v.id, reason.trim(), currentUser);
+    if (!cv.count) { setCancelModal(null); return; }
+    const amt = Number(v.amount) || 0;
+    const orders = v.orderId && v.type === "قبض" ? data.orders.map((o) => o.id === v.orderId ? { ...o, deposit: Math.max(0, (Number(o.deposit) || 0) - amt) } : o) : data.orders;
+    const auditLog = [...(data.auditLog || []), logEntry(currentUser, "إلغاء سند", `سند ${v.type} رقم ${v.voucherNo} — ${fmtNum(amt)} ر.س — السبب: ${reason.trim()}`)];
+    update({ vouchers: cv.vouchers, financeAccounts: cv.financeAccounts, orders, auditLog });
+    setCancelModal(null);
+  };
   const [vModal, setVModal] = useState(null);
   const [jModal, setJModal] = useState(null);
   const [printingVoucher, setPrintingVoucher] = useState(null);
@@ -2390,10 +2829,10 @@ function FinanceView({ data, update, canEdit, currentUser }) {
     const extra = {};
     if (values.partyType === "موظف" && values.partyId) extra.employeeId = values.partyId;
     if (values.partyType === "مورد" && values.partyId) extra.supplierId = values.partyId;
-    const bv = buildVoucher(data.counters, { ...values, ...extra, date: values.date || todayStr() }, currentUser);
+    const bv = buildVoucher(data.counters, { ...values, ...extra, date: values.date || todayStr() }, currentUser, data);
     const vouchers = [...data.vouchers, bv.voucher];
     const accounts = data.financeAccounts.map((a) => a.id === values.accountId ? { ...a, balance: (Number(a.balance) || 0) + (values.type === "قبض" ? Number(values.amount) : -Number(values.amount)) } : a);
-    update({ vouchers, financeAccounts: accounts, counters: bv.counters }); setVModal(null);
+    update({ vouchers, financeAccounts: accounts, counters: bv.counters, freedNumbers: bv.freedNumbers }); setVModal(null);
   };
   const jFields = [
     { key: "fromAccount", label: "من حساب", type: "select", options: data.financeAccounts.map((a) => ({ value: a.id, label: a.name })) },
@@ -2416,7 +2855,7 @@ function FinanceView({ data, update, canEdit, currentUser }) {
   const [dateTo, setDateTo] = useState("");
   const inRange = (d) => { if (!d) return !dateFrom && !dateTo; if (dateFrom && d < dateFrom) return false; if (dateTo && d > dateTo) return false; return true; };
   const filteredOrders = data.orders.filter((o) => inRange(o.createdAt));
-  const filteredVouchers = data.vouchers.filter((v) => inRange(v.date));
+  const filteredVouchers = liveVouchers(data).filter((v) => inRange(v.date));
   const filteredData = { ...data, orders: filteredOrders, vouchers: filteredVouchers };
 
   const revenueByBranch = data.branches.map((b) => ({ name: b.name, total: filteredOrders.filter((o) => o.branch === b.id && !o.cancelled).reduce((s, o) => s + (Number(o.price) || 0), 0) }));
@@ -2434,9 +2873,9 @@ function FinanceView({ data, update, canEdit, currentUser }) {
         </div>
       </Panel>
       <FinanceCharts data={filteredData} />
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(160px,1fr))", gap: 14, marginBottom: 20 }}>
+      {!data._scope && <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(160px,1fr))", gap: 14, marginBottom: 20 }}>
         {data.financeAccounts.map((a) => <Panel key={a.id}><div style={{ fontSize: 13, color: "#7A7061" }}>{a.name}</div><div style={{ fontSize: 22, fontWeight: 700 }}>{a.balance.toLocaleString()} ر.س</div></Panel>)}
-      </div>
+      </div>}
       <Panel style={{ marginBottom: 20 }}>
         <div style={{ fontWeight: 700, marginBottom: 10 }}>الأرباح والخسائر حسب الفرع {(dateFrom || dateTo) && <span style={{ fontSize: 11.5, color: THEME.teal, fontWeight: 400 }}>(بالمدى المحدد)</span>}</div>
         {data.branches.map((b) => {
@@ -2447,17 +2886,27 @@ function FinanceView({ data, update, canEdit, currentUser }) {
         <div style={{ marginTop: 10, fontSize: 12.5, color: "#7A7061" }}>خيارات الدفع تابي وتمارا متاحة عند الفوترة؛ تفعيلها الفعلي يتطلب ربط API مع حساب تاجر معتمد لدى كل مزوّد.</div>
       </Panel>
 
-      <CrudSection icon={Wallet} title="السندات (قبض / صرف)" addLabel="سند جديد" columns={["الرقم", "النوع", "الطرف", "الحساب", "التصنيف", "المبلغ", "البيان", "التاريخ", "طباعة"]} items={data.vouchers} searchKeys={["description", "voucherNo", "partyName"]}
+      <CrudSection icon={Wallet} title="السندات (قبض / صرف)" addLabel="سند جديد" columns={["الرقم", "النوع", "الطرف", "الحساب", "التصنيف", "المبلغ", "البيان", "التاريخ", ""]} items={data.vouchers} searchKeys={["description", "voucherNo", "partyName"]}
         onAdd={canEdit ? () => setVModal({ mode: "add", values: { type: "قبض", accountId: data.financeAccounts[0]?.id, branch: data.branches[0]?.id, category: incomeCategories[2], date: todayStr() } }) : undefined}
         renderRow={(it) => {
-          const pr = voucherPartyInfo(data, it);
-          return (<><td style={{ padding: "10px 14px", fontWeight: 700, color: THEME.brass }}>{it.voucherNo || "—"}</td><td style={{ padding: "10px 14px" }}><Badge color={it.type === "قبض" ? THEME.teal : THEME.red}>{it.type}</Badge></td><td style={{ padding: "10px 14px", fontSize: 13 }}>{pr.find((r) => r.label === "الاسم")?.value || "—"}</td><td style={{ padding: "10px 14px" }}>{data.financeAccounts.find((a) => a.id === it.accountId)?.name}</td><td style={{ padding: "10px 14px" }}>{it.category || "—"}</td><td style={{ padding: "10px 14px" }}>{fmtNum(it.amount)} ر.س</td><td style={{ padding: "10px 14px" }}>{it.description}</td><td style={{ padding: "10px 14px" }}>{it.date}</td><td style={{ padding: "10px 14px" }}><Btn small variant="ghost" onClick={() => setPrintingVoucher(it)}><Printer size={13} /></Btn></td></>);
+          const pr = voucherPartyInfo(data, it); const dead = it.status === "cancelled";
+          const cell = { padding: "10px 14px", opacity: dead ? 0.55 : 1, textDecoration: dead ? "line-through" : "none" };
+          return (<><td style={{ ...cell, fontWeight: 700, color: THEME.brass }}>{it.voucherNo || "—"}{dead && <div style={{ textDecoration: "none" }}><Badge color={THEME.red}>ملغى</Badge></div>}</td><td style={cell}><Badge color={it.type === "قبض" ? THEME.teal : THEME.red}>{it.type}</Badge></td><td style={{ ...cell, fontSize: 13 }}>{pr.find((r) => r.label === "الاسم")?.value || "—"}</td><td style={cell}>{data.financeAccounts.find((a) => a.id === it.accountId)?.name}</td><td style={cell}>{it.category || "—"}</td><td style={cell}>{fmtNum(it.amount)} ر.س</td><td style={cell}>{it.description}{dead && it.cancelReason && <div style={{ fontSize: 11.5, color: THEME.red, textDecoration: "none" }}>سبب الإلغاء: {it.cancelReason}</div>}</td><td style={cell}>{it.date}</td><td style={{ padding: "10px 14px", whiteSpace: "nowrap" }}><Btn small variant="ghost" onClick={() => setPrintingVoucher(it)}><Printer size={13} /></Btn>{canEdit && !dead && <Btn small variant="danger" onClick={() => setCancelModal({ voucher: it, reason: "" })} style={{ marginRight: 4 }}>إلغاء</Btn>}{canEdit && data._isAdmin && <Btn small variant="danger" onClick={() => setDelVoucher(it)} style={{ marginRight: 4 }} title="حذف نهائي (مدير النظام)"><Trash2 size={13} /></Btn>}</td></>);
         }} />
+      {delVoucher && <AdminDeleteModal title={`حذف نهائي للسند رقم ${delVoucher.voucherNo}`} numberLabel="رقم السند" number={delVoucher.voucherNo} lines={[`${delVoucher.type} بمبلغ ${fmtNum(delVoucher.amount)} ر.س — ${delVoucher.description || ""}`, delVoucher.status === "cancelled" ? "السند ملغى أصلًا، فلن يتغير رصيد الحساب." : "يُعاد أثره على رصيد الحساب."]} onConfirm={(free) => deleteVoucherForever(delVoucher, free)} onClose={() => setDelVoucher(null)} />}
+      {cancelModal && (
+        <Modal title={`إلغاء السند رقم ${cancelModal.voucher.voucherNo}`} onClose={() => setCancelModal(null)}>
+          <div style={{ fontSize: 13.5, marginBottom: 10 }}>{cancelModal.voucher.type} بمبلغ <b>{fmtNum(cancelModal.voucher.amount)} ر.س</b> — {cancelModal.voucher.description}</div>
+          <div style={{ fontSize: 12.5, color: "#7A7061", marginBottom: 10 }}>يبقى السند ظاهرًا برقمه وحالة «ملغى»، ويُعاد أثره على رصيد الحساب{cancelModal.voucher.orderId && cancelModal.voucher.type === "قبض" ? " ويُنقص المدفوع من الطلب" : ""}، ويُستثنى من الكشوفات والتقارير. لا يمكن التراجع.</div>
+          <Field label="سبب الإلغاء (إلزامي)"><TextInput value={cancelModal.reason} onChange={(e) => setCancelModal({ ...cancelModal, reason: e.target.value })} /></Field>
+          <div style={{ display: "flex", gap: 8 }}><Btn variant="danger" onClick={cancelVoucher}>تأكيد الإلغاء</Btn><Btn variant="ghost" onClick={() => setCancelModal(null)}>تراجع</Btn></div>
+        </Modal>
+      )}
 
       <div style={{ height: 20 }} />
-      <CrudSection icon={Wallet} title="قيود التحويل بين الحسابات" addLabel="قيد جديد" columns={["الرقم", "من", "إلى", "المبلغ", "البيان", "التاريخ", "طباعة"]} items={data.journalEntries} searchKeys={["description", "journalNo"]}
+      {!data._scope && <CrudSection icon={Wallet} title="قيود التحويل بين الحسابات" addLabel="قيد جديد" columns={["الرقم", "من", "إلى", "المبلغ", "البيان", "التاريخ", "طباعة"]} items={data.journalEntries} searchKeys={["description", "journalNo"]}
         onAdd={canEdit ? () => setJModal({ mode: "add", values: { fromAccount: data.financeAccounts[0]?.id, toAccount: data.financeAccounts[1]?.id || data.financeAccounts[0]?.id } }) : undefined}
-        renderRow={(it) => (<><td style={{ padding: "10px 14px", fontWeight: 700, color: THEME.brass }}>{it.journalNo || "—"}</td><td style={{ padding: "10px 14px" }}>{data.financeAccounts.find((a) => a.id === it.fromAccount)?.name}</td><td style={{ padding: "10px 14px" }}>{data.financeAccounts.find((a) => a.id === it.toAccount)?.name}</td><td style={{ padding: "10px 14px" }}>{it.amount} ر.س</td><td style={{ padding: "10px 14px" }}>{it.description}</td><td style={{ padding: "10px 14px" }}>{it.date}</td><td style={{ padding: "10px 14px" }}><Btn small variant="ghost" onClick={() => setPrintingJournal(it)}><Printer size={13} /></Btn></td></>)} />
+        renderRow={(it) => (<><td style={{ padding: "10px 14px", fontWeight: 700, color: THEME.brass }}>{it.journalNo || "—"}</td><td style={{ padding: "10px 14px" }}>{data.financeAccounts.find((a) => a.id === it.fromAccount)?.name}</td><td style={{ padding: "10px 14px" }}>{data.financeAccounts.find((a) => a.id === it.toAccount)?.name}</td><td style={{ padding: "10px 14px" }}>{it.amount} ر.س</td><td style={{ padding: "10px 14px" }}>{it.description}</td><td style={{ padding: "10px 14px" }}>{it.date}</td><td style={{ padding: "10px 14px" }}><Btn small variant="ghost" onClick={() => setPrintingJournal(it)}><Printer size={13} /></Btn></td></>)} />}
 
       {vModal && (
         <Modal title="سند جديد" onClose={() => setVModal(null)}>
@@ -2510,7 +2959,7 @@ function UsersView({ data, update, canEdit, currentUser }) {
     else { const i = list.findIndex((u) => u.id === toSave.id); list[i] = toSave; }
     update({ users: list }); setModal(null);
   };
-  const moduleLabels = { dashboard: "لوحة التحكم", customers: "العملاء", orders: "الطلبات", courier: "شاشة المراسل", appointments: "المواعيد", designs: "دليل التصاميم", invoices: "الفواتير", employees: "الموظفون", suppliers: "المشتريات", finance: "المالية", users: "المستخدمون", settings: "بيانات المحل", reports: "التقارير" };
+  const moduleLabels = { dashboard: "لوحة التحكم", customers: "العملاء", orders: "الطلبات", courier: "شاشة المراسل", appointments: "المواعيد", designs: "دليل التصاميم", invoices: "الفواتير", employees: "الموظفون", suppliers: "المشتريات", inventory: "المخزون", finance: "المالية", users: "المستخدمون", settings: "بيانات المحل", reports: "التقارير" };
 
   return (
     <div>
@@ -2622,8 +3071,9 @@ function StorageUsagePanel({ data }) {
   );
 }
 
-function ShopSettingsView({ data, update, canEdit, backupApi, currentUser }) {
+function ShopSettingsView({ data, update, canEdit, backupApi, currentUser, isAdmin }) {
   const [values, setValues] = useState(data.shopSettings || {});
+  const initialRef = useRef(data.shopSettings || {});
   const [saved, setSaved] = useState(false);
   const fileRef = useRef(null);
   const backupFileRef = useRef(null);
@@ -2631,10 +3081,24 @@ function ShopSettingsView({ data, update, canEdit, backupApi, currentUser }) {
   const onLogoFile = (e) => {
     const file = e.target.files[0]; if (!file) return;
     const reader = new FileReader();
-    reader.onload = async () => { const compressed = await compressImageDataUrl(reader.result, 240, 0.8); setValues((v) => ({ ...v, logo: compressed })); };
+    reader.onload = async () => {
+      const compressed = await compressImageDataUrl(reader.result, 480, 0.85);
+      setValues((v) => ({ ...v, logo: compressed }));
+      setLogoNow(compressed);                       // the logo applies to every invoice/voucher right away
+    };
     reader.readAsDataURL(file);
+    e.target.value = "";
   };
-  const save = () => { update({ shopSettings: values }); setSaved(true); setTimeout(() => setSaved(false), 2000); };
+  const setLogoNow = (logo) => { update({ shopSettings: { ...(latestShopRef.current || {}), logo } }); initialRef.current = { ...initialRef.current, logo }; };
+  const latestShopRef = useRef(data.shopSettings);
+  latestShopRef.current = data.shopSettings;
+  // only the fields you actually edited are written, so a stale form can never undo something saved elsewhere (e.g. the logo)
+  const save = () => {
+    const changed = {}; Object.keys(values).forEach((k) => { if (!deepEq(values[k], initialRef.current[k])) changed[k] = values[k]; });
+    update({ shopSettings: { ...(data.shopSettings || {}), ...changed } });
+    initialRef.current = { ...values };
+    setSaved(true); setTimeout(() => setSaved(false), 2000);
+  };
 
   const exportBackup = () => {
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
@@ -2691,7 +3155,7 @@ function ShopSettingsView({ data, update, canEdit, backupApi, currentUser }) {
           <div>
             <Btn small variant="ghost" onClick={() => fileRef.current.click()}><Upload size={14} />رفع شعار</Btn>
             <input ref={fileRef} type="file" accept="image/*" onChange={onLogoFile} style={{ display: "none" }} />
-            {values.logo && <span style={{ marginRight: 10, fontSize: 12.5, color: THEME.red, cursor: "pointer" }} onClick={() => setValues({ ...values, logo: "" })}>إزالة الشعار</span>}
+            {values.logo && <span style={{ marginRight: 10, fontSize: 12.5, color: THEME.red, cursor: "pointer" }} onClick={() => { setValues({ ...values, logo: "" }); setLogoNow(""); }}>إزالة الشعار</span>}
           </div>
         </div>
 
@@ -2727,6 +3191,14 @@ function ShopSettingsView({ data, update, canEdit, backupApi, currentUser }) {
         <div style={{ fontSize: 11.5, color: "#8A8071", marginBottom: 6 }}>استخدم {"{name}"} و{"{date}"} و{"{time}"} و{"{shop}"}.</div>
         <Field label=""><textarea rows={2} value={values.reminderMessageTemplate || ""} onChange={(e) => setValues({ ...values, reminderMessageTemplate: e.target.value })} style={{ ...inputStyle, resize: "vertical" }} /></Field>
 
+        <div style={{ fontWeight: 700, margin: "16px 0 6px" }}>نص الاعتذار عن تأخير الطلب</div>
+        <div style={{ fontSize: 11.5, color: "#8A8071", marginBottom: 6 }}>استخدم {"{name}"} و{"{orderNo}"} و{"{deliveryDate}"} و{"{trackLink}"} و{"{shop}"}.</div>
+        <Field label=""><textarea rows={3} value={values.delayMessageTemplate ?? WA_NEW_DEFAULTS.delayMessageTemplate} onChange={(e) => setValues({ ...values, delayMessageTemplate: e.target.value })} style={{ ...inputStyle, resize: "vertical" }} /></Field>
+
+        <div style={{ fontWeight: 700, margin: "16px 0 6px" }}>نص تذكير المبلغ المتبقي</div>
+        <div style={{ fontSize: 11.5, color: "#8A8071", marginBottom: 6 }}>استخدم {"{name}"} و{"{orderNo}"} و{"{balance}"} (المتبقي) و{"{shop}"}.</div>
+        <Field label=""><textarea rows={2} value={values.balanceMessageTemplate ?? WA_NEW_DEFAULTS.balanceMessageTemplate} onChange={(e) => setValues({ ...values, balanceMessageTemplate: e.target.value })} style={{ ...inputStyle, resize: "vertical" }} /></Field>
+
         <div style={{ fontWeight: 700, margin: "16px 0 10px" }}>ثيم ألوان النظام</div>
         <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 6 }}>
           {Object.entries(PALETTES).map(([key, p]) => (
@@ -2748,6 +3220,7 @@ function ShopSettingsView({ data, update, canEdit, backupApi, currentUser }) {
         </div>
       </Panel>
       <PrintTemplatesPanel data={data} update={update} />
+      {isAdmin && <FreedNumbersPanel data={data} update={update} />}
       {backupApi && <BackupPanel backupApi={backupApi} currentUser={currentUser} />}
     </div>
   );
@@ -3049,6 +3522,7 @@ const NAV = [
   { id: "invoices", label: "الفواتير", icon: Receipt },
   { id: "employees", label: "الموظفون", icon: Briefcase },
   { id: "suppliers", label: "المشتريات والموردون", icon: Truck },
+  { id: "inventory", label: "المخزون", icon: Package },
   { id: "finance", label: "الإدارة المالية", icon: Wallet },
   { id: "users", label: "المستخدمون والنظام", icon: ShieldCheck },
   { id: "settings", label: "بيانات المحل", icon: Store },
@@ -3130,6 +3604,17 @@ export default function App() {
         if (parsed.counters.purchase === undefined) parsed.counters.purchase = 1000;
         if (parsed.purchases) { let p = parsed.counters.purchase; parsed.purchases = parsed.purchases.map((pur) => pur.purchaseNo ? pur : (p += 1, { ...pur, purchaseNo: p })); parsed.counters.purchase = p; }
         if (!parsed.employeeLedger) parsed.employeeLedger = [];
+        parsed.shopSettings = { ...WA_NEW_DEFAULTS, ...(parsed.shopSettings || {}) };
+        if (!parsed.freedNumbers) parsed.freedNumbers = {};
+        if (!parsed.stockAdjustments) parsed.stockAdjustments = [];
+        if (!parsed.consumptionRules) parsed.consumptionRules = [];
+        if (!parsed.inventoryItems) {
+          // first run: build the catalog from what was already purchased (fabric alert thresholds carry over)
+          const seen = new Map();
+          (parsed.purchases || []).forEach((pu) => { const k = normName(pu.item); if (k && Number(pu.qty) > 0 && !seen.has(k)) seen.set(k, { id: uid("inv"), name: String(pu.item).trim(), category: pu.category || "أخرى", unit: pu.unit || "", minQty: Number(parsed.fabricThresholds?.[pu.item]) || 0 }); });
+          parsed.inventoryItems = [...seen.values()];
+        }
+        parsed.users = (parsed.users || []).map((u) => u.permissions && !u.permissions.inventory ? { ...u, permissions: { ...u.permissions, inventory: u.role === "مدير عام" ? { view: true, edit: true } : { ...(u.permissions.suppliers || { view: false, edit: false }) } } } : u);
         if (!parsed.printSettings) parsed.printSettings = { defaults: { invoice: ["classic", "modern", "minimal", "elegant"].includes(parsed.invoiceTheme) ? parsed.invoiceTheme : "classic" }, customTemplates: [] };
         else { parsed.printSettings.defaults = parsed.printSettings.defaults || {}; parsed.printSettings.customTemplates = parsed.printSettings.customTemplates || []; }
         if (!parsed.vouchers) parsed.vouchers = [];
@@ -3272,20 +3757,24 @@ export default function App() {
   const effectiveTab = visibleTabs.some((v) => v.id === tab) ? tab : (visibleTabs[0]?.id || "dashboard");
   const canEdit = !!activeUser.permissions?.[effectiveTab]?.edit;
 
+  const allowedBranches = userBranchScope(data, activeUser);
+  const sdata = { ...(allowedBranches ? scopeData(data, allowedBranches) : data), _isAdmin: activeUser.role === "مدير عام" };
+  const supdate = allowedBranches ? (patch) => update(mergeScopedPatch(latestRef.current || data, allowedBranches, patch)) : update;
   const views = {
-    dashboard: <Dashboard data={data} />,
-    customers: <CustomersView data={data} update={update} canEdit={canEdit} currentUser={activeUser.name} />,
-    orders: <OrdersView data={data} update={update} canEdit={canEdit} currentUser={activeUser.name} currentUserRole={activeUser.role} />,
-    courier: <CourierView data={data} update={update} canEdit={canEdit} />,
-    appointments: <AppointmentsView data={data} update={update} canEdit={canEdit} />,
+    dashboard: <Dashboard data={sdata} update={supdate} canEdit={canEdit} />,
+    customers: <CustomersView data={sdata} update={supdate} canEdit={canEdit} currentUser={activeUser.name} />,
+    orders: <OrdersView data={sdata} update={supdate} canEdit={canEdit} currentUser={activeUser.name} currentUserRole={activeUser.role} />,
+    courier: <CourierView data={sdata} update={supdate} canEdit={canEdit} />,
+    appointments: <AppointmentsView data={sdata} update={supdate} canEdit={canEdit} />,
     designs: <DesignsView data={data} update={update} canEdit={canEdit} />,
-    invoices: <InvoicesView data={data} update={update} />,
-    employees: <EmployeesView data={data} update={update} canEdit={canEdit} currentUser={activeUser.name} />,
-    suppliers: <SuppliersView data={data} update={update} canEdit={canEdit} />,
-    finance: <FinanceView data={data} update={update} canEdit={canEdit} currentUser={activeUser.name} />,
+    invoices: <InvoicesView data={sdata} update={supdate} />,
+    employees: <EmployeesView data={sdata} update={supdate} canEdit={canEdit} currentUser={activeUser.name} />,
+    suppliers: <SuppliersView data={sdata} update={supdate} canEdit={canEdit} />,
+    inventory: <InventoryView data={sdata} update={supdate} canEdit={canEdit} currentUser={activeUser.name} />,
+    finance: <FinanceView data={sdata} update={supdate} canEdit={canEdit} currentUser={activeUser.name} />,
     users: <UsersView data={data} update={update} canEdit={canEdit} currentUser={activeUser.name} />,
-    settings: <ShopSettingsView data={data} update={update} canEdit={canEdit} backupApi={backupApi} currentUser={activeUser.name} />,
-    reports: <ReportsView data={data} />,
+    settings: <ShopSettingsView data={data} update={update} canEdit={canEdit} backupApi={backupApi} currentUser={activeUser.name} isAdmin={activeUser.role === "مدير عام"} />,
+    reports: <ReportsView data={sdata} />,
   };
 
   return (
@@ -3325,7 +3814,7 @@ export default function App() {
             ) : hasPendingSync ? (
               <span style={{ fontSize: 12, background: "#C9A2271a", color: "#8A6D1F", padding: "4px 10px", borderRadius: 20 }}>🟡 جاري مزامنة تغييرات معلّقة...</span>
             ) : null}
-            <span style={{ fontSize: 12.5, color: "#7A7061" }}>مسجّل الدخول: <b>{activeUser.name}</b> ({activeUser.role})</span>
+            <span style={{ fontSize: 12.5, color: "#7A7061" }}>مسجّل الدخول: <b>{activeUser.name}</b> ({activeUser.role}){allowedBranches ? ` — ${sdata.branches.map((b) => b.name).join("، ")}` : " — كل الفروع"}</span>
             <Btn small variant="ghost" onClick={() => setPwModal({ current: "", next: "", error: "" })}>تغيير كلمة المرور</Btn>
             <Btn small variant="ghost" onClick={handleLogout}>تسجيل الخروج</Btn>
           </div>
